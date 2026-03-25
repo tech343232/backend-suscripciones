@@ -1,63 +1,66 @@
 import os
 import hashlib
+import time
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
+
 import requests
 import stripe
-
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from supabase import create_client, Client
 
-app = FastAPI()
+app = FastAPI(title="Backend Suscripciones", version="1.0.0")
 
 # =========================
 # VARIABLES DE ENTORNO
 # =========================
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-
 META_PIXEL_ID = os.getenv("META_PIXEL_ID", "")
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "")
-
 APP_URL = os.getenv("APP_URL", "")
+PRICE_ID = os.getenv("PRICE_ID", "")
+
+REQUIRED_VARS = {
+    "STRIPE_SECRET_KEY": STRIPE_SECRET_KEY,
+    "STRIPE_WEBHOOK_SECRET": STRIPE_WEBHOOK_SECRET,
+    "SUPABASE_URL": SUPABASE_URL,
+    "SUPABASE_SERVICE_ROLE_KEY": SUPABASE_SERVICE_ROLE_KEY,
+    "APP_URL": APP_URL,
+    "PRICE_ID": PRICE_ID,
+}
+
+missing = [name for name, value in REQUIRED_VARS.items() if not value]
+if missing:
+    raise RuntimeError(f"Faltan variables de entorno requeridas: {', '.join(missing)}")
 
 stripe.api_key = STRIPE_SECRET_KEY
-
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
 # =========================
 # FUNCIONES AUXILIARES
 # =========================
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def sha256_value(value: str) -> str:
-    """Hashea un valor para Meta CAPI."""
     return hashlib.sha256(value.strip().lower().encode("utf-8")).hexdigest()
 
 
-def update_user_status_by_customer_id(customer_id: str, status: str, subscription_id: str | None = None):
+def unix_to_iso(timestamp: Optional[int]) -> Optional[str]:
+    if not timestamp:
+        return None
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+
+def send_meta_purchase_event(email: Optional[str], value: Optional[float], currency: str = "USD") -> None:
     """
-    Actualiza el estado del usuario en Supabase usando stripe_customer_id.
-    Espera una tabla users con columna stripe_customer_id.
-    """
-    data = {"subscription_status": status}
-
-    if subscription_id:
-        data["stripe_subscription_id"] = subscription_id
-
-    response = (
-        supabase.table("users")
-        .update(data)
-        .eq("stripe_customer_id", customer_id)
-        .execute()
-    )
-    return response
-
-
-def send_meta_purchase_event(email: str | None, value: float | int | None, currency: str = "USD"):
-    """
-    Envía una conversión a Meta CAPI.
-    Se recomienda enviar email hasheado si lo tienes.
+    Meta CAPI opcional. Si faltan variables, simplemente no envía nada.
     """
     if not META_PIXEL_ID or not META_ACCESS_TOKEN:
         print("Meta CAPI no configurado. Saltando evento.")
@@ -71,13 +74,13 @@ def send_meta_purchase_event(email: str | None, value: float | int | None, curre
         "data": [
             {
                 "event_name": "Purchase",
-                "event_time": int(__import__("time").time()),
+                "event_time": int(time.time()),
                 "action_source": "website",
                 "user_data": user_data,
                 "custom_data": {
                     "currency": currency,
-                    "value": float(value or 0)
-                }
+                    "value": float(value or 0),
+                },
             }
         ]
     }
@@ -87,10 +90,7 @@ def send_meta_purchase_event(email: str | None, value: float | int | None, curre
     print("Meta CAPI status:", r.status_code, r.text)
 
 
-def get_customer_email_from_session(session_obj: dict) -> str | None:
-    """
-    Intenta sacar email desde checkout.session.completed.
-    """
+def get_customer_email_from_session(session_obj: Dict[str, Any]) -> Optional[str]:
     customer_details = session_obj.get("customer_details") or {}
     email = customer_details.get("email")
     if email:
@@ -100,7 +100,80 @@ def get_customer_email_from_session(session_obj: dict) -> str | None:
     if customer_email:
         return customer_email
 
+    metadata = session_obj.get("metadata") or {}
+    if metadata.get("email"):
+        return metadata["email"]
+
     return None
+
+
+def get_subscription(subscription_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not subscription_id:
+        return None
+    try:
+        sub = stripe.Subscription.retrieve(subscription_id)
+        return sub
+    except Exception as e:
+        print("No se pudo obtener la suscripción:", str(e))
+        return None
+
+
+def upsert_user_by_email(
+    email: str,
+    customer_id: Optional[str] = None,
+    subscription_id: Optional[str] = None,
+    status: Optional[str] = None,
+    access_active: Optional[bool] = None,
+    price_id: Optional[str] = None,
+    current_period_end: Optional[str] = None,
+) -> None:
+    existing = supabase.table("users").select("*").eq("email", email).execute()
+
+    data: Dict[str, Any] = {"updated_at": now_iso()}
+
+    if customer_id is not None:
+        data["stripe_customer_id"] = customer_id
+    if subscription_id is not None:
+        data["stripe_subscription_id"] = subscription_id
+    if status is not None:
+        data["subscription_status"] = status
+    if access_active is not None:
+        data["access_active"] = access_active
+    if price_id is not None:
+        data["price_id"] = price_id
+    if current_period_end is not None:
+        data["current_period_end"] = current_period_end
+
+    if existing.data:
+        supabase.table("users").update(data).eq("email", email).execute()
+    else:
+        data["email"] = email
+        data["created_at"] = now_iso()
+        supabase.table("users").insert(data).execute()
+
+
+def update_user_by_customer_id(
+    customer_id: str,
+    status: Optional[str] = None,
+    subscription_id: Optional[str] = None,
+    access_active: Optional[bool] = None,
+    price_id: Optional[str] = None,
+    current_period_end: Optional[str] = None,
+) -> None:
+    data: Dict[str, Any] = {"updated_at": now_iso()}
+
+    if status is not None:
+        data["subscription_status"] = status
+    if subscription_id is not None:
+        data["stripe_subscription_id"] = subscription_id
+    if access_active is not None:
+        data["access_active"] = access_active
+    if price_id is not None:
+        data["price_id"] = price_id
+    if current_period_end is not None:
+        data["current_period_end"] = current_period_end
+
+    supabase.table("users").update(data).eq("stripe_customer_id", customer_id).execute()
 
 
 # =========================
@@ -110,9 +183,22 @@ def get_customer_email_from_session(session_obj: dict) -> str | None:
 def root():
     return {"ok": True, "message": "Backend activo"}
 
+
 @app.get("/health")
 def health():
     return {"status": "running"}
+
+
+@app.get("/config-check")
+def config_check():
+    return {
+        "ok": True,
+        "stripe_configured": bool(STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET),
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY),
+        "meta_configured": bool(META_PIXEL_ID and META_ACCESS_TOKEN),
+        "app_url": APP_URL,
+        "price_id_loaded": bool(PRICE_ID),
+    }
 
 
 # =========================
@@ -121,28 +207,28 @@ def health():
 @app.post("/create-checkout-session")
 async def create_checkout_session(request: Request):
     """
-    Crea sesión de Stripe Checkout para suscripción.
-    Requiere recibir:
+    Body esperado:
     {
-      "price_id": "price_xxx",
       "email": "cliente@correo.com"
     }
+
+    El price_id sale de la variable PRICE_ID en Railway.
     """
     body = await request.json()
-    price_id = body.get("price_id")
-    email = body.get("email")
+    email = (body.get("email") or "").strip().lower()
 
-    if not price_id:
-        raise HTTPException(status_code=400, detail="Falta price_id")
+    if not email:
+        raise HTTPException(status_code=400, detail="Falta email")
 
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
             payment_method_types=["card"],
-            line_items=[{"price": price_id, "quantity": 1}],
+            line_items=[{"price": PRICE_ID, "quantity": 1}],
             customer_email=email,
             success_url=f"{APP_URL}/success?session_id={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{APP_URL}/cancel",
+            metadata={"email": email},
         )
         return {"checkout_url": session.url}
     except Exception as e:
@@ -161,7 +247,7 @@ async def stripe_webhook(request: Request):
         event = stripe.Webhook.construct_event(
             payload=payload,
             sig_header=sig_header,
-            secret=STRIPE_WEBHOOK_SECRET
+            secret=STRIPE_WEBHOOK_SECRET,
         )
     except ValueError:
         raise HTTPException(status_code=400, detail="Payload inválido")
@@ -173,67 +259,119 @@ async def stripe_webhook(request: Request):
 
     print("Evento recibido:", event_type)
 
-    # =========================
-    # 1) CHECKOUT COMPLETADO
-    # =========================
+    # 1) Checkout completado
     if event_type == "checkout.session.completed":
         customer_id = obj.get("customer")
         subscription_id = obj.get("subscription")
         email = get_customer_email_from_session(obj)
 
-        # activar usuario
-        if customer_id:
-            update_user_status_by_customer_id(
+        subscription = get_subscription(subscription_id)
+        status = subscription.get("status") if subscription else "active"
+        current_period_end = unix_to_iso(subscription.get("current_period_end")) if subscription else None
+
+        resolved_price_id = PRICE_ID
+        if subscription:
+            items = subscription.get("items", {}).get("data", [])
+            if items and items[0].get("price", {}).get("id"):
+                resolved_price_id = items[0]["price"]["id"]
+
+        if email:
+            upsert_user_by_email(
+                email=email,
                 customer_id=customer_id,
-                status="active",
-                subscription_id=subscription_id
+                subscription_id=subscription_id,
+                status=status,
+                access_active=True,
+                price_id=resolved_price_id,
+                current_period_end=current_period_end,
+            )
+        elif customer_id:
+            update_user_by_customer_id(
+                customer_id=customer_id,
+                status=status,
+                subscription_id=subscription_id,
+                access_active=True,
+                price_id=resolved_price_id,
+                current_period_end=current_period_end,
             )
 
-        # enviar compra a meta
-        amount_total = obj.get("amount_total", 0) / 100
+        amount_total = (obj.get("amount_total") or 0) / 100
         currency = (obj.get("currency") or "usd").upper()
         send_meta_purchase_event(email=email, value=amount_total, currency=currency)
 
-    # =========================
-    # 2) FACTURA PAGADA
-    # =========================
+    # 2) Factura pagada
     elif event_type == "invoice.paid":
         customer_id = obj.get("customer")
         subscription_id = obj.get("subscription")
 
+        subscription = get_subscription(subscription_id)
+        status = subscription.get("status") if subscription else "active"
+        current_period_end = unix_to_iso(subscription.get("current_period_end")) if subscription else None
+
+        resolved_price_id = PRICE_ID
+        if subscription:
+            items = subscription.get("items", {}).get("data", [])
+            if items and items[0].get("price", {}).get("id"):
+                resolved_price_id = items[0]["price"]["id"]
+
         if customer_id:
-            update_user_status_by_customer_id(
+            update_user_by_customer_id(
                 customer_id=customer_id,
-                status="active",
-                subscription_id=subscription_id
+                status=status,
+                subscription_id=subscription_id,
+                access_active=True,
+                price_id=resolved_price_id,
+                current_period_end=current_period_end,
             )
 
-    # =========================
-    # 3) FACTURA FALLIDA
-    # =========================
+    # 3) Factura fallida
     elif event_type == "invoice.payment_failed":
         customer_id = obj.get("customer")
         subscription_id = obj.get("subscription")
 
         if customer_id:
-            update_user_status_by_customer_id(
+            update_user_by_customer_id(
                 customer_id=customer_id,
                 status="past_due",
-                subscription_id=subscription_id
+                subscription_id=subscription_id,
+                access_active=False,
             )
 
-    # =========================
-    # 4) SUSCRIPCIÓN CANCELADA
-    # =========================
+    # 4) Suscripción actualizada
+    elif event_type == "customer.subscription.updated":
+        customer_id = obj.get("customer")
+        subscription_id = obj.get("id")
+        status = obj.get("status")
+        current_period_end = unix_to_iso(obj.get("current_period_end"))
+
+        items = obj.get("items", {}).get("data", [])
+        resolved_price_id = PRICE_ID
+        if items and items[0].get("price", {}).get("id"):
+            resolved_price_id = items[0]["price"]["id"]
+
+        active = status in {"active", "trialing"}
+
+        if customer_id:
+            update_user_by_customer_id(
+                customer_id=customer_id,
+                status=status,
+                subscription_id=subscription_id,
+                access_active=active,
+                price_id=resolved_price_id,
+                current_period_end=current_period_end,
+            )
+
+    # 5) Suscripción cancelada
     elif event_type == "customer.subscription.deleted":
         customer_id = obj.get("customer")
         subscription_id = obj.get("id")
 
         if customer_id:
-            update_user_status_by_customer_id(
+            update_user_by_customer_id(
                 customer_id=customer_id,
                 status="canceled",
-                subscription_id=subscription_id
+                subscription_id=subscription_id,
+                access_active=False,
             )
 
-    return {"received": True}
+    return JSONResponse({"received": True})
