@@ -38,7 +38,35 @@ if missing:
     raise RuntimeError(f"Faltan variables de entorno requeridas: {', '.join(missing)}")
 
 stripe.api_key = STRIPE_SECRET_KEY
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+# 🔥 SOLUCIÓN:
+# No dejamos que un fallo de conexión con Supabase rompa toda la app
+supabase: Optional[Client] = None
+supabase_error: Optional[str] = None
+
+try:
+    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    print("✅ Supabase conectado correctamente")
+except Exception as e:
+    supabase_error = str(e)
+    print("❌ Error conectando a Supabase:", supabase_error)
+
+
+# =========================
+# MANEJO GLOBAL DE ERRORES
+# =========================
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    print(f"❌ Error global en {request.url.path}: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "ok": False,
+            "error": "Error interno del servidor",
+            "detail": str(exc),
+            "path": request.url.path,
+        },
+    )
 
 
 # =========================
@@ -56,6 +84,15 @@ def unix_to_iso(timestamp: Optional[int]) -> Optional[str]:
     if not timestamp:
         return None
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+
+def ensure_supabase() -> Client:
+    if supabase is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase no está disponible. {supabase_error or ''}".strip()
+        )
+    return supabase
 
 
 def send_meta_purchase_event(email: Optional[str], value: Optional[float], currency: str = "USD") -> None:
@@ -85,9 +122,12 @@ def send_meta_purchase_event(email: Optional[str], value: Optional[float], curre
         ]
     }
 
-    url = f"https://graph.facebook.com/v19.0/{META_PIXEL_ID}/events?access_token={META_ACCESS_TOKEN}"
-    r = requests.post(url, json=payload, timeout=20)
-    print("Meta CAPI status:", r.status_code, r.text)
+    try:
+        url = f"https://graph.facebook.com/v19.0/{META_PIXEL_ID}/events?access_token={META_ACCESS_TOKEN}"
+        r = requests.post(url, json=payload, timeout=20)
+        print("Meta CAPI status:", r.status_code, r.text)
+    except Exception as e:
+        print("Error enviando evento a Meta CAPI:", str(e))
 
 
 def get_customer_email_from_session(session_obj: Dict[str, Any]) -> Optional[str]:
@@ -127,7 +167,9 @@ def upsert_user_by_email(
     price_id: Optional[str] = None,
     current_period_end: Optional[str] = None,
 ) -> None:
-    existing = supabase.table("users").select("*").eq("email", email).execute()
+    sb = ensure_supabase()
+
+    existing = sb.table("users").select("*").eq("email", email).execute()
 
     data: Dict[str, Any] = {"updated_at": now_iso()}
 
@@ -145,11 +187,11 @@ def upsert_user_by_email(
         data["current_period_end"] = current_period_end
 
     if existing.data:
-        supabase.table("users").update(data).eq("email", email).execute()
+        sb.table("users").update(data).eq("email", email).execute()
     else:
         data["email"] = email
         data["created_at"] = now_iso()
-        supabase.table("users").insert(data).execute()
+        sb.table("users").insert(data).execute()
 
 
 def update_user_by_customer_id(
@@ -160,6 +202,8 @@ def update_user_by_customer_id(
     price_id: Optional[str] = None,
     current_period_end: Optional[str] = None,
 ) -> None:
+    sb = ensure_supabase()
+
     data: Dict[str, Any] = {"updated_at": now_iso()}
 
     if status is not None:
@@ -173,7 +217,7 @@ def update_user_by_customer_id(
     if current_period_end is not None:
         data["current_period_end"] = current_period_end
 
-    supabase.table("users").update(data).eq("stripe_customer_id", customer_id).execute()
+    sb.table("users").update(data).eq("stripe_customer_id", customer_id).execute()
 
 
 # =========================
@@ -181,12 +225,20 @@ def update_user_by_customer_id(
 # =========================
 @app.get("/")
 def root():
-    return {"ok": True, "message": "Backend activo"}
+    return {
+        "ok": True,
+        "message": "Backend activo",
+        "supabase_connected": supabase is not None,
+    }
 
 
 @app.get("/health")
 def health():
-    return {"status": "running"}
+    return {
+        "status": "running",
+        "time": time.time(),
+        "supabase_connected": supabase is not None,
+    }
 
 
 @app.get("/config-check")
@@ -195,6 +247,8 @@ def config_check():
         "ok": True,
         "stripe_configured": bool(STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET),
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY),
+        "supabase_connected": bool(supabase is not None),
+        "supabase_error": supabase_error,
         "meta_configured": bool(META_PIXEL_ID and META_ACCESS_TOKEN),
         "app_url": APP_URL,
         "price_id_loaded": bool(PRICE_ID),
@@ -232,6 +286,7 @@ async def create_checkout_session(request: Request):
         )
         return {"checkout_url": session.url}
     except Exception as e:
+        print("Error creando checkout:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
