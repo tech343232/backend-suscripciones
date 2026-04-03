@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from supabase import create_client
 
-app = FastAPI(title="Backend Suscripciones", version="2.0.0")
+app = FastAPI(title="Backend Suscripciones", version="3.0.0")
 
 
 # =========================
@@ -53,6 +53,40 @@ def get_supabase_client():
 def get_stripe_ready():
     stripe_secret = get_required_env("STRIPE_SECRET_KEY")
     stripe.api_key = stripe_secret
+
+
+def get_price_map() -> Dict[str, Dict[str, Any]]:
+    return {
+        get_required_env("PRICE_ID_BASICO"): {
+            "plan": "basico",
+            "contact_limit": 100,
+        },
+        get_required_env("PRICE_ID_PROFESIONAL"): {
+            "plan": "profesional",
+            "contact_limit": 450,
+        },
+        get_required_env("PRICE_ID_AVANZADO"): {
+            "plan": "avanzado",
+            "contact_limit": 1000,
+        },
+    }
+
+
+def get_plan_catalog() -> Dict[str, Dict[str, Any]]:
+    return {
+        "basico": {
+            "price_id": get_required_env("PRICE_ID_BASICO"),
+            "contact_limit": 100,
+        },
+        "profesional": {
+            "price_id": get_required_env("PRICE_ID_PROFESIONAL"),
+            "contact_limit": 450,
+        },
+        "avanzado": {
+            "price_id": get_required_env("PRICE_ID_AVANZADO"),
+            "contact_limit": 1000,
+        },
+    }
 
 
 # =========================
@@ -141,6 +175,23 @@ def get_subscription(subscription_id: Optional[str]) -> Optional[Dict[str, Any]]
         return None
 
 
+def resolve_plan_from_price_id(price_id: Optional[str]) -> Dict[str, Any]:
+    price_map = get_price_map()
+
+    if price_id and price_id in price_map:
+        return {
+            "price_id": price_id,
+            "plan": price_map[price_id]["plan"],
+            "contact_limit": price_map[price_id]["contact_limit"],
+        }
+
+    return {
+        "price_id": price_id,
+        "plan": None,
+        "contact_limit": 0,
+    }
+
+
 # =========================
 # HELPERS DB
 # =========================
@@ -152,6 +203,8 @@ def upsert_user_by_email(
     access_active: Optional[bool] = None,
     price_id: Optional[str] = None,
     current_period_end: Optional[str] = None,
+    plan: Optional[str] = None,
+    contact_limit: Optional[int] = None,
 ) -> None:
     sb = get_supabase_client()
 
@@ -171,12 +224,18 @@ def upsert_user_by_email(
         data["price_id"] = price_id
     if current_period_end is not None:
         data["current_period_end"] = current_period_end
+    if plan is not None:
+        data["plan"] = plan
+    if contact_limit is not None:
+        data["contact_limit"] = contact_limit
 
     if existing.data:
         sb.table("users").update(data).eq("email", email).execute()
     else:
         data["email"] = email
         data["created_at"] = now_iso()
+        if "contacts_used" not in data:
+            data["contacts_used"] = 0
         sb.table("users").insert(data).execute()
 
 
@@ -187,6 +246,8 @@ def update_user_by_customer_id(
     access_active: Optional[bool] = None,
     price_id: Optional[str] = None,
     current_period_end: Optional[str] = None,
+    plan: Optional[str] = None,
+    contact_limit: Optional[int] = None,
 ) -> None:
     sb = get_supabase_client()
 
@@ -202,8 +263,38 @@ def update_user_by_customer_id(
         data["price_id"] = price_id
     if current_period_end is not None:
         data["current_period_end"] = current_period_end
+    if plan is not None:
+        data["plan"] = plan
+    if contact_limit is not None:
+        data["contact_limit"] = contact_limit
 
     sb.table("users").update(data).eq("stripe_customer_id", customer_id).execute()
+
+
+def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    sb = get_supabase_client()
+    result = sb.table("users").select("*").eq("email", email).limit(1).execute()
+    if result.data:
+        return result.data[0]
+    return None
+
+
+def count_user_contacts(user_id: str) -> int:
+    sb = get_supabase_client()
+    result = sb.table("contacts").select("id").eq("user_id", user_id).execute()
+    return len(result.data or [])
+
+
+def sync_contacts_used(user_id: str) -> int:
+    sb = get_supabase_client()
+    total = count_user_contacts(user_id)
+    sb.table("users").update(
+        {
+            "contacts_used": total,
+            "updated_at": now_iso(),
+        }
+    ).eq("id", user_id).execute()
+    return total
 
 
 # =========================
@@ -231,7 +322,9 @@ def config_check():
         "SUPABASE_URL": bool(get_env("SUPABASE_URL")),
         "SUPABASE_SERVICE_ROLE_KEY": bool(get_env("SUPABASE_SERVICE_ROLE_KEY")),
         "APP_URL": bool(get_env("APP_URL")),
-        "PRICE_ID": bool(get_env("PRICE_ID")),
+        "PRICE_ID_BASICO": bool(get_env("PRICE_ID_BASICO")),
+        "PRICE_ID_PROFESIONAL": bool(get_env("PRICE_ID_PROFESIONAL")),
+        "PRICE_ID_AVANZADO": bool(get_env("PRICE_ID_AVANZADO")),
         "META_PIXEL_ID": bool(get_env("META_PIXEL_ID")),
         "META_ACCESS_TOKEN": bool(get_env("META_ACCESS_TOKEN")),
     }
@@ -252,6 +345,18 @@ def config_check():
     }
 
 
+@app.get("/plans")
+def get_plans():
+    return {
+        "ok": True,
+        "plans": {
+            "basico": {"contact_limit": 100},
+            "profesional": {"contact_limit": 450},
+            "avanzado": {"contact_limit": 1000},
+        },
+    }
+
+
 # =========================
 # CREAR CHECKOUT
 # =========================
@@ -259,29 +364,125 @@ def config_check():
 async def create_checkout_session(request: Request):
     body = await request.json()
     email = (body.get("email") or "").strip().lower()
+    plan = (body.get("plan") or "").strip().lower()
 
     if not email:
         raise HTTPException(status_code=400, detail="Falta email")
 
-    get_stripe_ready()
+    if not plan:
+        raise HTTPException(status_code=400, detail="Falta plan")
 
-    price_id = get_required_env("PRICE_ID")
+    plan_catalog = get_plan_catalog()
+    plan_data = plan_catalog.get(plan)
+
+    if not plan_data:
+        raise HTTPException(status_code=400, detail="Plan inválido")
+
+    get_stripe_ready()
     app_url = get_required_env("APP_URL")
 
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
             payment_method_types=["card"],
-            line_items=[{"price": price_id, "quantity": 1}],
+            line_items=[{"price": plan_data["price_id"], "quantity": 1}],
             customer_email=email,
             success_url=f"{app_url}/success?session_id={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{app_url}/cancel",
-            metadata={"email": email},
+            metadata={
+                "email": email,
+                "selected_plan": plan,
+            },
         )
         return {"checkout_url": session.url}
     except Exception as e:
         print("Error creando checkout:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================
+# CONTACTOS
+# =========================
+@app.post("/create-contact")
+async def create_contact(request: Request):
+    body = await request.json()
+
+    email = (body.get("email") or "").strip().lower()
+    name = (body.get("name") or "").strip()
+    phone = (body.get("phone") or "").strip()
+    notes = (body.get("notes") or "").strip()
+
+    if not email:
+        raise HTTPException(status_code=400, detail="Falta email")
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Falta name")
+
+    user = get_user_by_email(email)
+
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    if not user.get("access_active"):
+        raise HTTPException(status_code=403, detail="Suscripción inactiva")
+
+    user_id = user["id"]
+    contact_limit = int(user.get("contact_limit") or 0)
+
+    current_contacts = sync_contacts_used(user_id)
+
+    if current_contacts >= contact_limit:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Límite alcanzado. Tu plan permite {contact_limit} contactos activos.",
+        )
+
+    sb = get_supabase_client()
+    insert_result = sb.table("contacts").insert(
+        {
+            "user_id": user_id,
+            "name": name,
+            "phone": phone if phone else None,
+            "notes": notes if notes else None,
+        }
+    ).execute()
+
+    updated_contacts = sync_contacts_used(user_id)
+
+    return {
+        "ok": True,
+        "message": "Contacto creado correctamente",
+        "contact": insert_result.data[0] if insert_result.data else None,
+        "contacts_used": updated_contacts,
+        "contact_limit": contact_limit,
+        "remaining": max(contact_limit - updated_contacts, 0),
+    }
+
+
+@app.get("/my-plan")
+def my_plan(email: str):
+    email = email.strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Falta email")
+
+    user = get_user_by_email(email)
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    user_id = user["id"]
+    current_contacts = sync_contacts_used(user_id)
+
+    return {
+        "ok": True,
+        "email": user["email"],
+        "plan": user.get("plan"),
+        "access_active": user.get("access_active"),
+        "subscription_status": user.get("subscription_status"),
+        "contact_limit": int(user.get("contact_limit") or 0),
+        "contacts_used": current_contacts,
+        "remaining": max(int(user.get("contact_limit") or 0) - current_contacts, 0),
+        "current_period_end": user.get("current_period_end"),
+    }
 
 
 # =========================
@@ -308,7 +509,6 @@ async def stripe_webhook(request: Request):
 
     event_type = event["type"]
     obj = event["data"]["object"]
-    price_id_env = get_required_env("PRICE_ID")
 
     print("Evento recibido:", event_type)
 
@@ -321,11 +521,16 @@ async def stripe_webhook(request: Request):
         status = subscription.get("status") if subscription else "active"
         current_period_end = unix_to_iso(subscription.get("current_period_end")) if subscription else None
 
-        resolved_price_id = price_id_env
+        resolved_price_id = None
         if subscription:
             items = subscription.get("items", {}).get("data", [])
             if items and items[0].get("price", {}).get("id"):
                 resolved_price_id = items[0]["price"]["id"]
+
+        if not resolved_price_id:
+            resolved_price_id = obj.get("metadata", {}).get("price_id")
+
+        plan_info = resolve_plan_from_price_id(resolved_price_id)
 
         if email:
             upsert_user_by_email(
@@ -334,8 +539,10 @@ async def stripe_webhook(request: Request):
                 subscription_id=subscription_id,
                 status=status,
                 access_active=True,
-                price_id=resolved_price_id,
+                price_id=plan_info["price_id"],
                 current_period_end=current_period_end,
+                plan=plan_info["plan"],
+                contact_limit=plan_info["contact_limit"],
             )
         elif customer_id:
             update_user_by_customer_id(
@@ -343,8 +550,10 @@ async def stripe_webhook(request: Request):
                 status=status,
                 subscription_id=subscription_id,
                 access_active=True,
-                price_id=resolved_price_id,
+                price_id=plan_info["price_id"],
                 current_period_end=current_period_end,
+                plan=plan_info["plan"],
+                contact_limit=plan_info["contact_limit"],
             )
 
         amount_total = (obj.get("amount_total") or 0) / 100
@@ -359,11 +568,13 @@ async def stripe_webhook(request: Request):
         status = subscription.get("status") if subscription else "active"
         current_period_end = unix_to_iso(subscription.get("current_period_end")) if subscription else None
 
-        resolved_price_id = price_id_env
+        resolved_price_id = None
         if subscription:
             items = subscription.get("items", {}).get("data", [])
             if items and items[0].get("price", {}).get("id"):
                 resolved_price_id = items[0]["price"]["id"]
+
+        plan_info = resolve_plan_from_price_id(resolved_price_id)
 
         if customer_id:
             update_user_by_customer_id(
@@ -371,8 +582,10 @@ async def stripe_webhook(request: Request):
                 status=status,
                 subscription_id=subscription_id,
                 access_active=True,
-                price_id=resolved_price_id,
+                price_id=plan_info["price_id"],
                 current_period_end=current_period_end,
+                plan=plan_info["plan"],
+                contact_limit=plan_info["contact_limit"],
             )
 
     elif event_type == "invoice.payment_failed":
@@ -394,10 +607,11 @@ async def stripe_webhook(request: Request):
         current_period_end = unix_to_iso(obj.get("current_period_end"))
 
         items = obj.get("items", {}).get("data", [])
-        resolved_price_id = price_id_env
+        resolved_price_id = None
         if items and items[0].get("price", {}).get("id"):
             resolved_price_id = items[0]["price"]["id"]
 
+        plan_info = resolve_plan_from_price_id(resolved_price_id)
         active = status in {"active", "trialing"}
 
         if customer_id:
@@ -406,8 +620,10 @@ async def stripe_webhook(request: Request):
                 status=status,
                 subscription_id=subscription_id,
                 access_active=active,
-                price_id=resolved_price_id,
+                price_id=plan_info["price_id"],
                 current_period_end=current_period_end,
+                plan=plan_info["plan"],
+                contact_limit=plan_info["contact_limit"],
             )
 
     elif event_type == "customer.subscription.deleted":
