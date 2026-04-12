@@ -208,7 +208,7 @@ def upsert_user_by_email(
 ) -> None:
     sb = get_supabase_client()
 
-    existing = sb.table("users").select("*").eq("email", email).execute()
+    existing = sb.table("usuarios").select("*").eq("email", email).execute()
 
     data: Dict[str, Any] = {"updated_at": now_iso()}
 
@@ -230,13 +230,13 @@ def upsert_user_by_email(
         data["contact_limit"] = contact_limit
 
     if existing.data:
-        sb.table("users").update(data).eq("email", email).execute()
+        sb.table("usuarios").update(data).eq("email", email).execute()
     else:
         data["email"] = email
         data["created_at"] = now_iso()
         if "contacts_used" not in data:
             data["contacts_used"] = 0
-        sb.table("users").insert(data).execute()
+        sb.table("usuarios").insert(data).execute()
 
 
 def update_user_by_customer_id(
@@ -268,12 +268,12 @@ def update_user_by_customer_id(
     if contact_limit is not None:
         data["contact_limit"] = contact_limit
 
-    sb.table("users").update(data).eq("stripe_customer_id", customer_id).execute()
+    sb.table("usuarios").update(data).eq("stripe_customer_id", customer_id).execute()
 
 
 def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     sb = get_supabase_client()
-    result = sb.table("users").select("*").eq("email", email).limit(1).execute()
+    result = sb.table("usuarios").select("*").eq("email", email).limit(1).execute()
     if result.data:
         return result.data[0]
     return None
@@ -288,7 +288,7 @@ def count_user_contacts(user_id: str) -> int:
 def sync_contacts_used(user_id: str) -> int:
     sb = get_supabase_client()
     total = count_user_contacts(user_id)
-    sb.table("users").update(
+    sb.table("usuarios").update(
         {
             "contacts_used": total,
             "updated_at": now_iso(),
