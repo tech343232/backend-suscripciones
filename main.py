@@ -9,8 +9,18 @@ import stripe
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from supabase import create_client
+try:
+    from supabase import ClientOptions
+except ImportError:
+    try:
+        from supabase.lib.client_options import ClientOptions
+    except ImportError:
+        ClientOptions = None
 
 app = FastAPI(title="Backend Suscripciones", version="3.0.0")
+
+# Cliente Supabase singleton (se crea una sola vez y se reutiliza)
+_supabase_client = None
 
 
 # =========================
@@ -42,12 +52,63 @@ def get_required_env(name: str) -> str:
 
 
 def get_supabase_client():
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+
     supabase_url = get_required_env("SUPABASE_URL")
     supabase_key = get_required_env("SUPABASE_SERVICE_ROLE_KEY")
-    try:
-        return create_client(supabase_url, supabase_key)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error conectando a Supabase: {str(e)}")
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            if ClientOptions is not None:
+                options = ClientOptions(
+                    postgrest_client_timeout=60,
+                    storage_client_timeout=60,
+                )
+                _supabase_client = create_client(supabase_url, supabase_key, options=options)
+            else:
+                _supabase_client = create_client(supabase_url, supabase_key)
+            print(f"✅ Supabase conectado (intento {attempt + 1})")
+            return _supabase_client
+        except Exception as e:
+            last_error = e
+            print(f"⚠️ Intento {attempt + 1}/3 fallido conectando a Supabase: {e}")
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+
+    raise HTTPException(status_code=500, detail=f"Error conectando a Supabase: {str(last_error)}")
+
+
+def _with_retry(operation_fn, max_retries: int = 3, base_delay: float = 2.0):
+    """Ejecuta operation_fn() con reintentos ante errores de red/DNS."""
+    global _supabase_client
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return operation_fn()
+        except Exception as e:
+            last_exc = e
+            err_lower = str(e).lower()
+            is_network_error = any(tok in err_lower for tok in (
+                "name or service not known",
+                "connection refused",
+                "connection reset",
+                "timed out",
+                "timeout",
+                "temporary failure in name resolution",
+                "network unreachable",
+                "failed to establish",
+            ))
+            if is_network_error and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                print(f"⚠️ Error de red (intento {attempt + 1}/{max_retries}), reintentando en {delay}s: {e}")
+                _supabase_client = None  # forzar reconexión en el próximo intento
+                time.sleep(delay)
+            else:
+                raise
+    raise last_exc
 
 
 def get_stripe_ready():
@@ -206,10 +267,6 @@ def upsert_user_by_email(
     plan: Optional[str] = None,
     contact_limit: Optional[int] = None,
 ) -> None:
-    sb = get_supabase_client()
-
-    existing = sb.table("usuarios").select("*").eq("email", email).execute()
-
     data: Dict[str, Any] = {"updated_at": now_iso()}
 
     if customer_id is not None:
@@ -229,14 +286,16 @@ def upsert_user_by_email(
     if contact_limit is not None:
         data["contact_limit"] = contact_limit
 
-    if existing.data:
-        sb.table("usuarios").update(data).eq("email", email).execute()
-    else:
-        data["email"] = email
-        data["created_at"] = now_iso()
-        if "contacts_used" not in data:
-            data["contacts_used"] = 0
-        sb.table("usuarios").insert(data).execute()
+    def _do():
+        sb = get_supabase_client()
+        existing = sb.table("usuarios").select("id").eq("email", email).execute()
+        if existing.data:
+            sb.table("usuarios").update(data).eq("email", email).execute()
+        else:
+            row = {**data, "email": email, "created_at": now_iso(), "contacts_used": 0}
+            sb.table("usuarios").insert(row).execute()
+
+    _with_retry(_do)
 
 
 def update_user_by_customer_id(
@@ -249,8 +308,6 @@ def update_user_by_customer_id(
     plan: Optional[str] = None,
     contact_limit: Optional[int] = None,
 ) -> None:
-    sb = get_supabase_client()
-
     data: Dict[str, Any] = {"updated_at": now_iso()}
 
     if status is not None:
@@ -268,32 +325,38 @@ def update_user_by_customer_id(
     if contact_limit is not None:
         data["contact_limit"] = contact_limit
 
-    sb.table("usuarios").update(data).eq("stripe_customer_id", customer_id).execute()
+    _with_retry(
+        lambda: get_supabase_client()
+        .table("usuarios")
+        .update(data)
+        .eq("stripe_customer_id", customer_id)
+        .execute()
+    )
 
 
 def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
-    sb = get_supabase_client()
-    result = sb.table("usuarios").select("*").eq("email", email).limit(1).execute()
-    if result.data:
-        return result.data[0]
-    return None
+    result = _with_retry(
+        lambda: get_supabase_client().table("usuarios").select("*").eq("email", email).limit(1).execute()
+    )
+    return result.data[0] if result.data else None
 
 
 def count_user_contacts(user_id: str) -> int:
-    sb = get_supabase_client()
-    result = sb.table("contacts").select("id").eq("user_id", user_id).execute()
+    result = _with_retry(
+        lambda: get_supabase_client().table("contacts").select("id").eq("user_id", user_id).execute()
+    )
     return len(result.data or [])
 
 
 def sync_contacts_used(user_id: str) -> int:
-    sb = get_supabase_client()
     total = count_user_contacts(user_id)
-    sb.table("usuarios").update(
-        {
-            "contacts_used": total,
-            "updated_at": now_iso(),
-        }
-    ).eq("id", user_id).execute()
+    _with_retry(
+        lambda: get_supabase_client()
+        .table("usuarios")
+        .update({"contacts_used": total, "updated_at": now_iso()})
+        .eq("id", user_id)
+        .execute()
+    )
     return total
 
 
@@ -437,15 +500,16 @@ async def create_contact(request: Request):
             detail=f"Límite alcanzado. Tu plan permite {contact_limit} contactos activos.",
         )
 
-    sb = get_supabase_client()
-    insert_result = sb.table("contacts").insert(
-        {
-            "user_id": user_id,
-            "name": name,
-            "phone": phone if phone else None,
-            "notes": notes if notes else None,
-        }
-    ).execute()
+    insert_result = _with_retry(
+        lambda: get_supabase_client().table("contacts").insert(
+            {
+                "user_id": user_id,
+                "name": name,
+                "phone": phone if phone else None,
+                "notes": notes if notes else None,
+            }
+        ).execute()
+    )
 
     updated_contacts = sync_contacts_used(user_id)
 
