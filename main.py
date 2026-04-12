@@ -5,23 +5,12 @@ import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
-import requests
+import httpx
 import stripe
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from supabase import create_client
-try:
-    from supabase import ClientOptions
-except ImportError:
-    try:
-        from supabase.lib.client_options import ClientOptions
-    except ImportError:
-        ClientOptions = None
 
 app = FastAPI(title="Backend Suscripciones", version="3.0.0")
-
-# Cliente Supabase singleton (se crea una sola vez y se reutiliza)
-_supabase_client = None
 
 
 # =========================
@@ -52,47 +41,33 @@ def get_required_env(name: str) -> str:
     return value
 
 
-def get_supabase_client():
-    global _supabase_client
-    if _supabase_client is not None:
-        return _supabase_client
-
-    supabase_url = get_required_env("SUPABASE_URL")
-    supabase_key = get_required_env("SUPABASE_SERVICE_ROLE_KEY")
-
-    last_error = None
-    for attempt in range(3):
-        try:
-            if ClientOptions is not None:
-                options = ClientOptions(
-                    postgrest_client_timeout=60,
-                    storage_client_timeout=60,
-                )
-                _supabase_client = create_client(supabase_url, supabase_key, options=options)
-            else:
-                _supabase_client = create_client(supabase_url, supabase_key)
-            print(f"✅ Supabase conectado (intento {attempt + 1})")
-            return _supabase_client
-        except Exception as e:
-            last_error = e
-            print(f"⚠️ Intento {attempt + 1}/3 fallido conectando a Supabase: {e}")
-            if attempt < 2:
-                time.sleep(2 * (attempt + 1))
-
-    raise HTTPException(status_code=500, detail=f"Error conectando a Supabase: {str(last_error)}")
+# =========================
+# SUPABASE ASYNC (httpx directo, sin supabase-py)
+# =========================
+def _sb_base() -> str:
+    return get_required_env("SUPABASE_URL") + "/rest/v1"
 
 
-def _with_retry(operation_fn, max_retries: int = 5, base_delay: float = 5.0):
-    """Ejecuta operation_fn() con reintentos ante errores de red/DNS."""
-    global _supabase_client
+def _sb_headers() -> Dict[str, str]:
+    key = get_required_env("SUPABASE_SERVICE_ROLE_KEY")
+    return {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+
+async def _async_retry(coro_fn, max_retries: int = 5, base_delay: float = 5.0):
+    """Ejecuta coro_fn() con reintentos async ante errores de red/DNS."""
     last_exc = None
     for attempt in range(max_retries):
         try:
-            return operation_fn()
+            return await coro_fn()
         except Exception as e:
             last_exc = e
             err_lower = str(e).lower()
-            is_network_error = any(tok in err_lower for tok in (
+            is_network = any(tok in err_lower for tok in (
                 "name or service not known",
                 "connection refused",
                 "connection reset",
@@ -102,52 +77,32 @@ def _with_retry(operation_fn, max_retries: int = 5, base_delay: float = 5.0):
                 "network unreachable",
                 "failed to establish",
             ))
-            if is_network_error and attempt < max_retries - 1:
+            if is_network and attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
                 print(f"⚠️ Error de red (intento {attempt + 1}/{max_retries}), reintentando en {delay}s: {e}")
-                _supabase_client = None  # forzar reconexión en el próximo intento
-                time.sleep(delay)
+                await asyncio.sleep(delay)
             else:
                 raise
     raise last_exc
 
 
 def get_stripe_ready():
-    stripe_secret = get_required_env("STRIPE_SECRET_KEY")
-    stripe.api_key = stripe_secret
+    stripe.api_key = get_required_env("STRIPE_SECRET_KEY")
 
 
 def get_price_map() -> Dict[str, Dict[str, Any]]:
     return {
-        get_required_env("PRICE_ID_BASICO"): {
-            "plan": "basico",
-            "contact_limit": 100,
-        },
-        get_required_env("PRICE_ID_PROFESIONAL"): {
-            "plan": "profesional",
-            "contact_limit": 450,
-        },
-        get_required_env("PRICE_ID_AVANZADO"): {
-            "plan": "avanzado",
-            "contact_limit": 1000,
-        },
+        get_required_env("PRICE_ID_BASICO"): {"plan": "basico", "contact_limit": 100},
+        get_required_env("PRICE_ID_PROFESIONAL"): {"plan": "profesional", "contact_limit": 450},
+        get_required_env("PRICE_ID_AVANZADO"): {"plan": "avanzado", "contact_limit": 1000},
     }
 
 
 def get_plan_catalog() -> Dict[str, Dict[str, Any]]:
     return {
-        "basico": {
-            "price_id": get_required_env("PRICE_ID_BASICO"),
-            "contact_limit": 100,
-        },
-        "profesional": {
-            "price_id": get_required_env("PRICE_ID_PROFESIONAL"),
-            "contact_limit": 450,
-        },
-        "avanzado": {
-            "price_id": get_required_env("PRICE_ID_AVANZADO"),
-            "contact_limit": 1000,
-        },
+        "basico": {"price_id": get_required_env("PRICE_ID_BASICO"), "contact_limit": 100},
+        "profesional": {"price_id": get_required_env("PRICE_ID_PROFESIONAL"), "contact_limit": 450},
+        "avanzado": {"price_id": get_required_env("PRICE_ID_AVANZADO"), "contact_limit": 1000},
     }
 
 
@@ -171,7 +126,9 @@ async def global_exception_handler(request: Request, exc: Exception):
 # =========================
 # META CAPI (OPCIONAL)
 # =========================
-def send_meta_purchase_event(email: Optional[str], value: Optional[float], currency: str = "USD") -> None:
+async def send_meta_purchase_event(
+    email: Optional[str], value: Optional[float], currency: str = "USD"
+) -> None:
     meta_pixel_id = get_env("META_PIXEL_ID")
     meta_access_token = get_env("META_ACCESS_TOKEN")
 
@@ -190,18 +147,16 @@ def send_meta_purchase_event(email: Optional[str], value: Optional[float], curre
                 "event_time": int(time.time()),
                 "action_source": "website",
                 "user_data": user_data,
-                "custom_data": {
-                    "currency": currency,
-                    "value": float(value or 0),
-                },
+                "custom_data": {"currency": currency, "value": float(value or 0)},
             }
         ]
     }
 
     try:
         url = f"https://graph.facebook.com/v19.0/{meta_pixel_id}/events?access_token={meta_access_token}"
-        r = requests.post(url, json=payload, timeout=20)
-        print("Meta CAPI status:", r.status_code, r.text)
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(url, json=payload)
+            print("Meta CAPI status:", r.status_code, r.text)
     except Exception as e:
         print("Error enviando evento a Meta CAPI:", str(e))
 
@@ -214,11 +169,9 @@ def get_customer_email_from_session(session_obj: Dict[str, Any]) -> Optional[str
     email = customer_details.get("email")
     if email:
         return email
-
     customer_email = session_obj.get("customer_email")
     if customer_email:
         return customer_email
-
     metadata = session_obj.get("metadata") or {}
     return metadata.get("email")
 
@@ -226,12 +179,9 @@ def get_customer_email_from_session(session_obj: Dict[str, Any]) -> Optional[str
 def get_subscription(subscription_id: Optional[str]) -> Optional[Dict[str, Any]]:
     if not subscription_id:
         return None
-
     get_stripe_ready()
-
     try:
-        sub = stripe.Subscription.retrieve(subscription_id)
-        return sub
+        return stripe.Subscription.retrieve(subscription_id)
     except Exception as e:
         print("No se pudo obtener la suscripción:", str(e))
         return None
@@ -239,25 +189,19 @@ def get_subscription(subscription_id: Optional[str]) -> Optional[Dict[str, Any]]
 
 def resolve_plan_from_price_id(price_id: Optional[str]) -> Dict[str, Any]:
     price_map = get_price_map()
-
     if price_id and price_id in price_map:
         return {
             "price_id": price_id,
             "plan": price_map[price_id]["plan"],
             "contact_limit": price_map[price_id]["contact_limit"],
         }
-
-    return {
-        "price_id": price_id,
-        "plan": None,
-        "contact_limit": 0,
-    }
+    return {"price_id": price_id, "plan": None, "contact_limit": 0}
 
 
 # =========================
-# HELPERS DB
+# HELPERS DB (async, httpx directo)
 # =========================
-def upsert_user_by_email(
+async def upsert_user_by_email(
     email: str,
     customer_id: Optional[str] = None,
     subscription_id: Optional[str] = None,
@@ -269,7 +213,6 @@ def upsert_user_by_email(
     contact_limit: Optional[int] = None,
 ) -> None:
     data: Dict[str, Any] = {"updated_at": now_iso()}
-
     if customer_id is not None:
         data["stripe_customer_id"] = customer_id
     if subscription_id is not None:
@@ -287,19 +230,33 @@ def upsert_user_by_email(
     if contact_limit is not None:
         data["contact_limit"] = contact_limit
 
-    def _do():
-        sb = get_supabase_client()
-        existing = sb.table("usuarios").select("id").eq("email", email).execute()
-        if existing.data:
-            sb.table("usuarios").update(data).eq("email", email).execute()
-        else:
-            row = {**data, "email": email, "created_at": now_iso(), "contacts_used": 0}
-            sb.table("usuarios").insert(row).execute()
+    async def _do():
+        base = _sb_base()
+        headers = _sb_headers()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(
+                f"{base}/usuarios",
+                headers=headers,
+                params={"select": "id", "email": f"eq.{email}"},
+            )
+            r.raise_for_status()
+            if r.json():
+                r2 = await client.patch(
+                    f"{base}/usuarios",
+                    headers=headers,
+                    params={"email": f"eq.{email}"},
+                    json=data,
+                )
+                r2.raise_for_status()
+            else:
+                row = {**data, "email": email, "created_at": now_iso(), "contacts_used": 0}
+                r2 = await client.post(f"{base}/usuarios", headers=headers, json=row)
+                r2.raise_for_status()
 
-    _with_retry(_do)
+    await _async_retry(_do)
 
 
-def update_user_by_customer_id(
+async def update_user_by_customer_id(
     customer_id: str,
     status: Optional[str] = None,
     subscription_id: Optional[str] = None,
@@ -310,7 +267,6 @@ def update_user_by_customer_id(
     contact_limit: Optional[int] = None,
 ) -> None:
     data: Dict[str, Any] = {"updated_at": now_iso()}
-
     if status is not None:
         data["subscription_status"] = status
     if subscription_id is not None:
@@ -326,38 +282,70 @@ def update_user_by_customer_id(
     if contact_limit is not None:
         data["contact_limit"] = contact_limit
 
-    _with_retry(
-        lambda: get_supabase_client()
-        .table("usuarios")
-        .update(data)
-        .eq("stripe_customer_id", customer_id)
-        .execute()
-    )
+    async def _do():
+        base = _sb_base()
+        headers = _sb_headers()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.patch(
+                f"{base}/usuarios",
+                headers=headers,
+                params={"stripe_customer_id": f"eq.{customer_id}"},
+                json=data,
+            )
+            r.raise_for_status()
+
+    await _async_retry(_do)
 
 
-def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
-    result = _with_retry(
-        lambda: get_supabase_client().table("usuarios").select("*").eq("email", email).limit(1).execute()
-    )
-    return result.data[0] if result.data else None
+async def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    async def _do():
+        base = _sb_base()
+        headers = _sb_headers()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(
+                f"{base}/usuarios",
+                headers=headers,
+                params={"select": "*", "email": f"eq.{email}", "limit": "1"},
+            )
+            r.raise_for_status()
+            rows = r.json()
+            return rows[0] if rows else None
+
+    return await _async_retry(_do)
 
 
-def count_user_contacts(user_id: str) -> int:
-    result = _with_retry(
-        lambda: get_supabase_client().table("contacts").select("id").eq("user_id", user_id).execute()
-    )
-    return len(result.data or [])
+async def count_user_contacts(user_id: str) -> int:
+    async def _do():
+        base = _sb_base()
+        headers = _sb_headers()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(
+                f"{base}/contacts",
+                headers=headers,
+                params={"select": "id", "user_id": f"eq.{user_id}"},
+            )
+            r.raise_for_status()
+            return len(r.json())
+
+    return await _async_retry(_do)
 
 
-def sync_contacts_used(user_id: str) -> int:
-    total = count_user_contacts(user_id)
-    _with_retry(
-        lambda: get_supabase_client()
-        .table("usuarios")
-        .update({"contacts_used": total, "updated_at": now_iso()})
-        .eq("id", user_id)
-        .execute()
-    )
+async def sync_contacts_used(user_id: str) -> int:
+    total = await count_user_contacts(user_id)
+
+    async def _do():
+        base = _sb_base()
+        headers = _sb_headers()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.patch(
+                f"{base}/usuarios",
+                headers=headers,
+                params={"id": f"eq.{user_id}"},
+                json={"contacts_used": total, "updated_at": now_iso()},
+            )
+            r.raise_for_status()
+
+    await _async_retry(_do)
     return total
 
 
@@ -371,15 +359,11 @@ def root():
 
 @app.get("/health")
 def health():
-    return {
-        "status": "running",
-        "time": time.time(),
-        "service": "backend-suscripciones",
-    }
+    return {"status": "running", "time": time.time(), "service": "backend-suscripciones"}
 
 
 @app.get("/config-check")
-def config_check():
+async def config_check():
     checks = {
         "STRIPE_SECRET_KEY": bool(get_env("STRIPE_SECRET_KEY")),
         "STRIPE_WEBHOOK_SECRET": bool(get_env("STRIPE_WEBHOOK_SECRET")),
@@ -396,8 +380,14 @@ def config_check():
     supabase_ok = False
     supabase_error = None
     try:
-        _ = get_supabase_client()
-        supabase_ok = True
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{_sb_base()}/usuarios",
+                headers=_sb_headers(),
+                params={"select": "id", "limit": "1"},
+            )
+            r.raise_for_status()
+            supabase_ok = True
     except Exception as e:
         supabase_error = str(e)
 
@@ -432,13 +422,11 @@ async def create_checkout_session(request: Request):
 
     if not email:
         raise HTTPException(status_code=400, detail="Falta email")
-
     if not plan:
         raise HTTPException(status_code=400, detail="Falta plan")
 
     plan_catalog = get_plan_catalog()
     plan_data = plan_catalog.get(plan)
-
     if not plan_data:
         raise HTTPException(status_code=400, detail="Plan inválido")
 
@@ -454,10 +442,7 @@ async def create_checkout_session(request: Request):
                 customer_email=email,
                 success_url=f"{app_url}/success?session_id={{CHECKOUT_SESSION_ID}}",
                 cancel_url=f"{app_url}/cancel",
-                metadata={
-                    "email": email,
-                    "selected_plan": plan,
-                },
+                metadata={"email": email, "selected_plan": plan},
             )
         )
         return {"checkout_url": session.url}
@@ -480,22 +465,18 @@ async def create_contact(request: Request):
 
     if not email:
         raise HTTPException(status_code=400, detail="Falta email")
-
     if not name:
         raise HTTPException(status_code=400, detail="Falta name")
 
-    user = await asyncio.to_thread(get_user_by_email, email)
-
+    user = await get_user_by_email(email)
     if not user:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
-
     if not user.get("access_active"):
         raise HTTPException(status_code=403, detail="Suscripción inactiva")
 
     user_id = user["id"]
     contact_limit = int(user.get("contact_limit") or 0)
-
-    current_contacts = await asyncio.to_thread(sync_contacts_used, user_id)
+    current_contacts = await sync_contacts_used(user_id)
 
     if current_contacts >= contact_limit:
         raise HTTPException(
@@ -503,26 +484,31 @@ async def create_contact(request: Request):
             detail=f"Límite alcanzado. Tu plan permite {contact_limit} contactos activos.",
         )
 
-    def _do_insert():
-        return _with_retry(
-            lambda: get_supabase_client().table("contacts").insert(
-                {
+    async def _do_insert():
+        base = _sb_base()
+        headers = _sb_headers()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                f"{base}/contacts",
+                headers=headers,
+                json={
                     "user_id": user_id,
                     "name": name,
                     "phone": phone if phone else None,
                     "notes": notes if notes else None,
-                }
-            ).execute()
-        )
+                },
+            )
+            r.raise_for_status()
+            rows = r.json()
+            return rows[0] if rows else None
 
-    insert_result = await asyncio.to_thread(_do_insert)
-
-    updated_contacts = await asyncio.to_thread(sync_contacts_used, user_id)
+    insert_result = await _async_retry(_do_insert)
+    updated_contacts = await sync_contacts_used(user_id)
 
     return {
         "ok": True,
         "message": "Contacto creado correctamente",
-        "contact": insert_result.data[0] if insert_result.data else None,
+        "contact": insert_result,
         "contacts_used": updated_contacts,
         "contact_limit": contact_limit,
         "remaining": max(contact_limit - updated_contacts, 0),
@@ -530,17 +516,17 @@ async def create_contact(request: Request):
 
 
 @app.get("/my-plan")
-def my_plan(email: str):
+async def my_plan(email: str):
     email = email.strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="Falta email")
 
-    user = get_user_by_email(email)
+    user = await get_user_by_email(email)
     if not user:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
     user_id = user["id"]
-    current_contacts = sync_contacts_used(user_id)
+    current_contacts = await sync_contacts_used(user_id)
 
     return {
         "ok": True,
@@ -581,7 +567,13 @@ async def stripe_webhook(request: Request):
     supabase_ready = False
     for attempt in range(6):
         try:
-            await asyncio.to_thread(get_supabase_client)
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    f"{_sb_base()}/usuarios",
+                    headers=_sb_headers(),
+                    params={"select": "id", "limit": "1"},
+                )
+                r.raise_for_status()
             supabase_ready = True
             break
         except Exception as e:
@@ -611,15 +603,13 @@ async def stripe_webhook(request: Request):
             items = subscription.get("items", {}).get("data", [])
             if items and items[0].get("price", {}).get("id"):
                 resolved_price_id = items[0]["price"]["id"]
-
         if not resolved_price_id:
             resolved_price_id = obj.get("metadata", {}).get("price_id")
 
         plan_info = resolve_plan_from_price_id(resolved_price_id)
 
         if email:
-            await asyncio.to_thread(
-                upsert_user_by_email,
+            await upsert_user_by_email(
                 email=email,
                 customer_id=customer_id,
                 subscription_id=subscription_id,
@@ -631,8 +621,7 @@ async def stripe_webhook(request: Request):
                 contact_limit=plan_info["contact_limit"],
             )
         elif customer_id:
-            await asyncio.to_thread(
-                update_user_by_customer_id,
+            await update_user_by_customer_id(
                 customer_id=customer_id,
                 status=status,
                 subscription_id=subscription_id,
@@ -645,7 +634,7 @@ async def stripe_webhook(request: Request):
 
         amount_total = (obj.get("amount_total") or 0) / 100
         currency = (obj.get("currency") or "usd").upper()
-        await asyncio.to_thread(send_meta_purchase_event, email, amount_total, currency)
+        await send_meta_purchase_event(email=email, value=amount_total, currency=currency)
 
     elif event_type == "invoice.paid":
         customer_id = obj.get("customer")
@@ -664,8 +653,7 @@ async def stripe_webhook(request: Request):
         plan_info = resolve_plan_from_price_id(resolved_price_id)
 
         if customer_id:
-            await asyncio.to_thread(
-                update_user_by_customer_id,
+            await update_user_by_customer_id(
                 customer_id=customer_id,
                 status=status,
                 subscription_id=subscription_id,
@@ -681,8 +669,7 @@ async def stripe_webhook(request: Request):
         subscription_id = obj.get("subscription")
 
         if customer_id:
-            await asyncio.to_thread(
-                update_user_by_customer_id,
+            await update_user_by_customer_id(
                 customer_id=customer_id,
                 status="past_due",
                 subscription_id=subscription_id,
@@ -704,8 +691,7 @@ async def stripe_webhook(request: Request):
         active = status in {"active", "trialing"}
 
         if customer_id:
-            await asyncio.to_thread(
-                update_user_by_customer_id,
+            await update_user_by_customer_id(
                 customer_id=customer_id,
                 status=status,
                 subscription_id=subscription_id,
@@ -721,8 +707,7 @@ async def stripe_webhook(request: Request):
         subscription_id = obj.get("id")
 
         if customer_id:
-            await asyncio.to_thread(
-                update_user_by_customer_id,
+            await update_user_by_customer_id(
                 customer_id=customer_id,
                 status="canceled",
                 subscription_id=subscription_id,
