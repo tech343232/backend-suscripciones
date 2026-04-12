@@ -82,7 +82,7 @@ def get_supabase_client():
     raise HTTPException(status_code=500, detail=f"Error conectando a Supabase: {str(last_error)}")
 
 
-def _with_retry(operation_fn, max_retries: int = 3, base_delay: float = 2.0):
+def _with_retry(operation_fn, max_retries: int = 5, base_delay: float = 5.0):
     """Ejecuta operation_fn() con reintentos ante errores de red/DNS."""
     global _supabase_client
     last_exc = None
@@ -576,6 +576,21 @@ async def stripe_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Payload inválido")
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Firma inválida")
+
+    # Health check: esperar hasta 30s a que Supabase sea alcanzable antes de procesar
+    supabase_ready = False
+    for attempt in range(6):
+        try:
+            await asyncio.to_thread(get_supabase_client)
+            supabase_ready = True
+            break
+        except Exception as e:
+            print(f"⏳ Supabase no disponible (intento {attempt + 1}/6): {e}")
+            if attempt < 5:
+                await asyncio.sleep(5)
+
+    if not supabase_ready:
+        raise HTTPException(status_code=503, detail="Supabase no disponible tras 30s de espera")
 
     event_type = event["type"]
     obj = event["data"]["object"]
