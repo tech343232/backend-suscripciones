@@ -1,3 +1,4 @@
+import asyncio
 import os
 import hashlib
 import time
@@ -445,17 +446,19 @@ async def create_checkout_session(request: Request):
     app_url = get_required_env("APP_URL")
 
     try:
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            payment_method_types=["card"],
-            line_items=[{"price": plan_data["price_id"], "quantity": 1}],
-            customer_email=email,
-            success_url=f"{app_url}/success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{app_url}/cancel",
-            metadata={
-                "email": email,
-                "selected_plan": plan,
-            },
+        session = await asyncio.to_thread(
+            lambda: stripe.checkout.Session.create(
+                mode="subscription",
+                payment_method_types=["card"],
+                line_items=[{"price": plan_data["price_id"], "quantity": 1}],
+                customer_email=email,
+                success_url=f"{app_url}/success?session_id={{CHECKOUT_SESSION_ID}}",
+                cancel_url=f"{app_url}/cancel",
+                metadata={
+                    "email": email,
+                    "selected_plan": plan,
+                },
+            )
         )
         return {"checkout_url": session.url}
     except Exception as e:
@@ -481,7 +484,7 @@ async def create_contact(request: Request):
     if not name:
         raise HTTPException(status_code=400, detail="Falta name")
 
-    user = get_user_by_email(email)
+    user = await asyncio.to_thread(get_user_by_email, email)
 
     if not user:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
@@ -492,7 +495,7 @@ async def create_contact(request: Request):
     user_id = user["id"]
     contact_limit = int(user.get("contact_limit") or 0)
 
-    current_contacts = sync_contacts_used(user_id)
+    current_contacts = await asyncio.to_thread(sync_contacts_used, user_id)
 
     if current_contacts >= contact_limit:
         raise HTTPException(
@@ -500,18 +503,21 @@ async def create_contact(request: Request):
             detail=f"Límite alcanzado. Tu plan permite {contact_limit} contactos activos.",
         )
 
-    insert_result = _with_retry(
-        lambda: get_supabase_client().table("contacts").insert(
-            {
-                "user_id": user_id,
-                "name": name,
-                "phone": phone if phone else None,
-                "notes": notes if notes else None,
-            }
-        ).execute()
-    )
+    def _do_insert():
+        return _with_retry(
+            lambda: get_supabase_client().table("contacts").insert(
+                {
+                    "user_id": user_id,
+                    "name": name,
+                    "phone": phone if phone else None,
+                    "notes": notes if notes else None,
+                }
+            ).execute()
+        )
 
-    updated_contacts = sync_contacts_used(user_id)
+    insert_result = await asyncio.to_thread(_do_insert)
+
+    updated_contacts = await asyncio.to_thread(sync_contacts_used, user_id)
 
     return {
         "ok": True,
@@ -581,7 +587,7 @@ async def stripe_webhook(request: Request):
         subscription_id = obj.get("subscription")
         email = get_customer_email_from_session(obj)
 
-        subscription = get_subscription(subscription_id)
+        subscription = await asyncio.to_thread(get_subscription, subscription_id)
         status = subscription.get("status") if subscription else "active"
         current_period_end = unix_to_iso(subscription.get("current_period_end")) if subscription else None
 
@@ -597,7 +603,8 @@ async def stripe_webhook(request: Request):
         plan_info = resolve_plan_from_price_id(resolved_price_id)
 
         if email:
-            upsert_user_by_email(
+            await asyncio.to_thread(
+                upsert_user_by_email,
                 email=email,
                 customer_id=customer_id,
                 subscription_id=subscription_id,
@@ -609,7 +616,8 @@ async def stripe_webhook(request: Request):
                 contact_limit=plan_info["contact_limit"],
             )
         elif customer_id:
-            update_user_by_customer_id(
+            await asyncio.to_thread(
+                update_user_by_customer_id,
                 customer_id=customer_id,
                 status=status,
                 subscription_id=subscription_id,
@@ -622,13 +630,13 @@ async def stripe_webhook(request: Request):
 
         amount_total = (obj.get("amount_total") or 0) / 100
         currency = (obj.get("currency") or "usd").upper()
-        send_meta_purchase_event(email=email, value=amount_total, currency=currency)
+        await asyncio.to_thread(send_meta_purchase_event, email, amount_total, currency)
 
     elif event_type == "invoice.paid":
         customer_id = obj.get("customer")
         subscription_id = obj.get("subscription")
 
-        subscription = get_subscription(subscription_id)
+        subscription = await asyncio.to_thread(get_subscription, subscription_id)
         status = subscription.get("status") if subscription else "active"
         current_period_end = unix_to_iso(subscription.get("current_period_end")) if subscription else None
 
@@ -641,7 +649,8 @@ async def stripe_webhook(request: Request):
         plan_info = resolve_plan_from_price_id(resolved_price_id)
 
         if customer_id:
-            update_user_by_customer_id(
+            await asyncio.to_thread(
+                update_user_by_customer_id,
                 customer_id=customer_id,
                 status=status,
                 subscription_id=subscription_id,
@@ -657,7 +666,8 @@ async def stripe_webhook(request: Request):
         subscription_id = obj.get("subscription")
 
         if customer_id:
-            update_user_by_customer_id(
+            await asyncio.to_thread(
+                update_user_by_customer_id,
                 customer_id=customer_id,
                 status="past_due",
                 subscription_id=subscription_id,
@@ -679,7 +689,8 @@ async def stripe_webhook(request: Request):
         active = status in {"active", "trialing"}
 
         if customer_id:
-            update_user_by_customer_id(
+            await asyncio.to_thread(
+                update_user_by_customer_id,
                 customer_id=customer_id,
                 status=status,
                 subscription_id=subscription_id,
@@ -695,7 +706,8 @@ async def stripe_webhook(request: Request):
         subscription_id = obj.get("id")
 
         if customer_id:
-            update_user_by_customer_id(
+            await asyncio.to_thread(
+                update_user_by_customer_id,
                 customer_id=customer_id,
                 status="canceled",
                 subscription_id=subscription_id,
