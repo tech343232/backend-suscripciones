@@ -365,8 +365,42 @@ def root():
 
 
 @app.get("/health")
-def health():
-    return {"status": "running", "time": time.time(), "service": "backend-suscripciones"}
+async def health():
+    results = {}
+
+    # Prueba internet general
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get("https://www.google.com")
+        results["google"] = {"ok": True, "status_code": r.status_code}
+        print(f"✅ Google alcanzable: {r.status_code}")
+    except Exception as e:
+        results["google"] = {"ok": False, "error": str(e)}
+        print(f"❌ Google NO alcanzable: {e}")
+
+    # Prueba Supabase (ping al proyecto)
+    sb_url = get_env("SUPABASE_URL") or "https://lzxhrqfzpbyjyvoscjou.supabase.co"
+    sb_key = get_env("SUPABASE_SERVICE_ROLE_KEY")
+    try:
+        headers = {"apikey": sb_key, "Authorization": f"Bearer {sb_key}"} if sb_key else {}
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(
+                f"{sb_url}/rest/v1/usuarios",
+                headers=headers,
+                params={"select": "id", "limit": "1"},
+            )
+        results["supabase"] = {"ok": True, "status_code": r.status_code, "url": sb_url}
+        print(f"✅ Supabase alcanzable: {r.status_code}")
+    except Exception as e:
+        results["supabase"] = {"ok": False, "error": str(e), "url": sb_url}
+        print(f"❌ Supabase NO alcanzable ({sb_url}): {e}")
+
+    return {
+        "status": "running",
+        "time": time.time(),
+        "service": "backend-suscripciones",
+        "connectivity": results,
+    }
 
 
 @app.get("/config-check")
