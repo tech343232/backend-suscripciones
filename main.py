@@ -8,7 +8,6 @@ import asyncio
 import os
 import hashlib
 import time
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
@@ -18,42 +17,7 @@ from fastapi import BackgroundTasks, FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
 
-async def _wait_for_supabase(max_attempts: int = 12, delay: float = 10.0) -> None:
-    """Bloquea el arranque hasta que Supabase sea alcanzable (máx ~2 minutos)."""
-    sb_url = os.getenv("SUPABASE_URL", "").strip()
-    sb_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-    print(f"🔌 Esperando Supabase en: {sb_url}")
-    if not sb_url or not sb_key:
-        raise RuntimeError("Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY")
-    headers = {
-        "apikey": sb_key,
-        "Authorization": f"Bearer {sb_key}",
-    }
-    for attempt in range(max_attempts):
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.get(
-                    f"{sb_url}/rest/v1/usuarios",
-                    headers=headers,
-                    params={"select": "id", "limit": "1"},
-                )
-                r.raise_for_status()
-            print(f"✅ Supabase disponible tras {attempt + 1} intento(s)")
-            return
-        except Exception as e:
-            print(f"⏳ Supabase no disponible (intento {attempt + 1}/{max_attempts}): {e}")
-            if attempt < max_attempts - 1:
-                await asyncio.sleep(delay)
-    raise RuntimeError(f"Supabase no disponible tras {max_attempts} intentos ({max_attempts * delay}s)")
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await _wait_for_supabase()
-    yield
-
-
-app = FastAPI(title="Backend Suscripciones", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="Backend Suscripciones", version="3.0.0")
 
 
 # =========================
