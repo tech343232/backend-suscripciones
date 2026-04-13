@@ -8,15 +8,52 @@ import asyncio
 import os
 import hashlib
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 import httpx
 import stripe
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Backend Suscripciones", version="3.0.0")
+
+async def _wait_for_supabase(max_attempts: int = 12, delay: float = 10.0) -> None:
+    """Bloquea el arranque hasta que Supabase sea alcanzable (máx ~2 minutos)."""
+    sb_url = os.getenv("SUPABASE_URL", "").strip()
+    sb_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    print(f"🔌 Esperando Supabase en: {sb_url}")
+    if not sb_url or not sb_key:
+        raise RuntimeError("Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY")
+    headers = {
+        "apikey": sb_key,
+        "Authorization": f"Bearer {sb_key}",
+    }
+    for attempt in range(max_attempts):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(
+                    f"{sb_url}/rest/v1/usuarios",
+                    headers=headers,
+                    params={"select": "id", "limit": "1"},
+                )
+                r.raise_for_status()
+            print(f"✅ Supabase disponible tras {attempt + 1} intento(s)")
+            return
+        except Exception as e:
+            print(f"⏳ Supabase no disponible (intento {attempt + 1}/{max_attempts}): {e}")
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(delay)
+    raise RuntimeError(f"Supabase no disponible tras {max_attempts} intentos ({max_attempts * delay}s)")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await _wait_for_supabase()
+    yield
+
+
+app = FastAPI(title="Backend Suscripciones", version="3.0.0", lifespan=lifespan)
 
 
 # =========================
@@ -64,7 +101,7 @@ def _sb_headers() -> Dict[str, str]:
     }
 
 
-async def _async_retry(coro_fn, max_retries: int = 5, base_delay: float = 5.0):
+async def _async_retry(coro_fn, max_retries: int = 7, base_delay: float = 5.0, max_delay: float = 60.0):
     """Ejecuta coro_fn() con reintentos async ante errores de red/DNS."""
     last_exc = None
     for attempt in range(max_retries):
@@ -84,7 +121,7 @@ async def _async_retry(coro_fn, max_retries: int = 5, base_delay: float = 5.0):
                 "failed to establish",
             ))
             if is_network and attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
+                delay = min(base_delay * (2 ** attempt), max_delay)
                 print(f"⚠️ Error de red (intento {attempt + 1}/{max_retries}), reintentando en {delay}s: {e}")
                 await asyncio.sleep(delay)
             else:
@@ -550,8 +587,144 @@ async def my_plan(email: str):
 # =========================
 # WEBHOOK STRIPE
 # =========================
+async def _process_stripe_event(event: Dict[str, Any]) -> None:
+    """Procesa el evento de Stripe en segundo plano para no bloquear la respuesta a Stripe."""
+    event_type = event["type"]
+    obj = event["data"]["object"]
+    print("Evento recibido:", event_type)
+
+    try:
+        if event_type == "checkout.session.completed":
+            customer_id = obj.get("customer")
+            subscription_id = obj.get("subscription")
+            email = get_customer_email_from_session(obj)
+
+            subscription = await asyncio.to_thread(get_subscription, subscription_id)
+            status = subscription.get("status") if subscription else "active"
+            current_period_end = unix_to_iso(subscription.get("current_period_end")) if subscription else None
+
+            resolved_price_id = None
+            if subscription:
+                items = subscription.get("items", {}).get("data", [])
+                if items and items[0].get("price", {}).get("id"):
+                    resolved_price_id = items[0]["price"]["id"]
+            if not resolved_price_id:
+                resolved_price_id = obj.get("metadata", {}).get("price_id")
+
+            plan_info = resolve_plan_from_price_id(resolved_price_id)
+
+            if email:
+                await upsert_user_by_email(
+                    email=email,
+                    customer_id=customer_id,
+                    subscription_id=subscription_id,
+                    status=status,
+                    access_active=True,
+                    price_id=plan_info["price_id"],
+                    current_period_end=current_period_end,
+                    plan=plan_info["plan"],
+                    contact_limit=plan_info["contact_limit"],
+                )
+            elif customer_id:
+                await update_user_by_customer_id(
+                    customer_id=customer_id,
+                    status=status,
+                    subscription_id=subscription_id,
+                    access_active=True,
+                    price_id=plan_info["price_id"],
+                    current_period_end=current_period_end,
+                    plan=plan_info["plan"],
+                    contact_limit=plan_info["contact_limit"],
+                )
+
+            amount_total = (obj.get("amount_total") or 0) / 100
+            currency = (obj.get("currency") or "usd").upper()
+            await send_meta_purchase_event(email=email, value=amount_total, currency=currency)
+
+        elif event_type == "invoice.paid":
+            customer_id = obj.get("customer")
+            subscription_id = obj.get("subscription")
+
+            subscription = await asyncio.to_thread(get_subscription, subscription_id)
+            status = subscription.get("status") if subscription else "active"
+            current_period_end = unix_to_iso(subscription.get("current_period_end")) if subscription else None
+
+            resolved_price_id = None
+            if subscription:
+                items = subscription.get("items", {}).get("data", [])
+                if items and items[0].get("price", {}).get("id"):
+                    resolved_price_id = items[0]["price"]["id"]
+
+            plan_info = resolve_plan_from_price_id(resolved_price_id)
+
+            if customer_id:
+                await update_user_by_customer_id(
+                    customer_id=customer_id,
+                    status=status,
+                    subscription_id=subscription_id,
+                    access_active=True,
+                    price_id=plan_info["price_id"],
+                    current_period_end=current_period_end,
+                    plan=plan_info["plan"],
+                    contact_limit=plan_info["contact_limit"],
+                )
+
+        elif event_type == "invoice.payment_failed":
+            customer_id = obj.get("customer")
+            subscription_id = obj.get("subscription")
+
+            if customer_id:
+                await update_user_by_customer_id(
+                    customer_id=customer_id,
+                    status="past_due",
+                    subscription_id=subscription_id,
+                    access_active=False,
+                )
+
+        elif event_type == "customer.subscription.updated":
+            customer_id = obj.get("customer")
+            subscription_id = obj.get("id")
+            status = obj.get("status")
+            current_period_end = unix_to_iso(obj.get("current_period_end"))
+
+            items = obj.get("items", {}).get("data", [])
+            resolved_price_id = None
+            if items and items[0].get("price", {}).get("id"):
+                resolved_price_id = items[0]["price"]["id"]
+
+            plan_info = resolve_plan_from_price_id(resolved_price_id)
+            active = status in {"active", "trialing"}
+
+            if customer_id:
+                await update_user_by_customer_id(
+                    customer_id=customer_id,
+                    status=status,
+                    subscription_id=subscription_id,
+                    access_active=active,
+                    price_id=plan_info["price_id"],
+                    current_period_end=current_period_end,
+                    plan=plan_info["plan"],
+                    contact_limit=plan_info["contact_limit"],
+                )
+
+        elif event_type == "customer.subscription.deleted":
+            customer_id = obj.get("customer")
+            subscription_id = obj.get("id")
+
+            if customer_id:
+                await update_user_by_customer_id(
+                    customer_id=customer_id,
+                    status="canceled",
+                    subscription_id=subscription_id,
+                    access_active=False,
+                )
+
+    except Exception as e:
+        print(f"❌ Error procesando evento Stripe {event_type}: {e}")
+
+
 @app.post("/webhook/stripe")
-async def stripe_webhook(request: Request):
+async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
     get_stripe_ready()
     webhook_secret = get_required_env("STRIPE_WEBHOOK_SECRET")
 
@@ -569,155 +742,6 @@ async def stripe_webhook(request: Request):
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Firma inválida")
 
-    # Health check: esperar hasta 30s a que Supabase sea alcanzable antes de procesar
-    supabase_ready = False
-    for attempt in range(6):
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                r = await client.get(
-                    f"{_sb_base()}/usuarios",
-                    headers=_sb_headers(),
-                    params={"select": "id", "limit": "1"},
-                )
-                r.raise_for_status()
-            supabase_ready = True
-            break
-        except Exception as e:
-            print(f"⏳ Supabase no disponible (intento {attempt + 1}/6): {e}")
-            if attempt < 5:
-                await asyncio.sleep(5)
-
-    if not supabase_ready:
-        raise HTTPException(status_code=503, detail="Supabase no disponible tras 30s de espera")
-
-    event_type = event["type"]
-    obj = event["data"]["object"]
-
-    print("Evento recibido:", event_type)
-
-    if event_type == "checkout.session.completed":
-        customer_id = obj.get("customer")
-        subscription_id = obj.get("subscription")
-        email = get_customer_email_from_session(obj)
-
-        subscription = await asyncio.to_thread(get_subscription, subscription_id)
-        status = subscription.get("status") if subscription else "active"
-        current_period_end = unix_to_iso(subscription.get("current_period_end")) if subscription else None
-
-        resolved_price_id = None
-        if subscription:
-            items = subscription.get("items", {}).get("data", [])
-            if items and items[0].get("price", {}).get("id"):
-                resolved_price_id = items[0]["price"]["id"]
-        if not resolved_price_id:
-            resolved_price_id = obj.get("metadata", {}).get("price_id")
-
-        plan_info = resolve_plan_from_price_id(resolved_price_id)
-
-        if email:
-            await upsert_user_by_email(
-                email=email,
-                customer_id=customer_id,
-                subscription_id=subscription_id,
-                status=status,
-                access_active=True,
-                price_id=plan_info["price_id"],
-                current_period_end=current_period_end,
-                plan=plan_info["plan"],
-                contact_limit=plan_info["contact_limit"],
-            )
-        elif customer_id:
-            await update_user_by_customer_id(
-                customer_id=customer_id,
-                status=status,
-                subscription_id=subscription_id,
-                access_active=True,
-                price_id=plan_info["price_id"],
-                current_period_end=current_period_end,
-                plan=plan_info["plan"],
-                contact_limit=plan_info["contact_limit"],
-            )
-
-        amount_total = (obj.get("amount_total") or 0) / 100
-        currency = (obj.get("currency") or "usd").upper()
-        await send_meta_purchase_event(email=email, value=amount_total, currency=currency)
-
-    elif event_type == "invoice.paid":
-        customer_id = obj.get("customer")
-        subscription_id = obj.get("subscription")
-
-        subscription = await asyncio.to_thread(get_subscription, subscription_id)
-        status = subscription.get("status") if subscription else "active"
-        current_period_end = unix_to_iso(subscription.get("current_period_end")) if subscription else None
-
-        resolved_price_id = None
-        if subscription:
-            items = subscription.get("items", {}).get("data", [])
-            if items and items[0].get("price", {}).get("id"):
-                resolved_price_id = items[0]["price"]["id"]
-
-        plan_info = resolve_plan_from_price_id(resolved_price_id)
-
-        if customer_id:
-            await update_user_by_customer_id(
-                customer_id=customer_id,
-                status=status,
-                subscription_id=subscription_id,
-                access_active=True,
-                price_id=plan_info["price_id"],
-                current_period_end=current_period_end,
-                plan=plan_info["plan"],
-                contact_limit=plan_info["contact_limit"],
-            )
-
-    elif event_type == "invoice.payment_failed":
-        customer_id = obj.get("customer")
-        subscription_id = obj.get("subscription")
-
-        if customer_id:
-            await update_user_by_customer_id(
-                customer_id=customer_id,
-                status="past_due",
-                subscription_id=subscription_id,
-                access_active=False,
-            )
-
-    elif event_type == "customer.subscription.updated":
-        customer_id = obj.get("customer")
-        subscription_id = obj.get("id")
-        status = obj.get("status")
-        current_period_end = unix_to_iso(obj.get("current_period_end"))
-
-        items = obj.get("items", {}).get("data", [])
-        resolved_price_id = None
-        if items and items[0].get("price", {}).get("id"):
-            resolved_price_id = items[0]["price"]["id"]
-
-        plan_info = resolve_plan_from_price_id(resolved_price_id)
-        active = status in {"active", "trialing"}
-
-        if customer_id:
-            await update_user_by_customer_id(
-                customer_id=customer_id,
-                status=status,
-                subscription_id=subscription_id,
-                access_active=active,
-                price_id=plan_info["price_id"],
-                current_period_end=current_period_end,
-                plan=plan_info["plan"],
-                contact_limit=plan_info["contact_limit"],
-            )
-
-    elif event_type == "customer.subscription.deleted":
-        customer_id = obj.get("customer")
-        subscription_id = obj.get("id")
-
-        if customer_id:
-            await update_user_by_customer_id(
-                customer_id=customer_id,
-                status="canceled",
-                subscription_id=subscription_id,
-                access_active=False,
-            )
-
+    # Responde 200 de inmediato a Stripe y procesa en segundo plano
+    background_tasks.add_task(_process_stripe_event, event)
     return JSONResponse({"received": True})
