@@ -1,3 +1,9 @@
+import socket
+_original_getaddrinfo = socket.getaddrinfo
+def patched_getaddrinfo(host, port, *args, **kwargs):
+    return _original_getaddrinfo(host, port, *args, **kwargs)
+socket.getaddrinfo = patched_getaddrinfo
+
 import asyncio
 import os
 import hashlib
