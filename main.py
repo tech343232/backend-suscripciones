@@ -425,7 +425,21 @@ async def health():
     except Exception as e:
         results["supabase_http"] = {"ok": False, "error": str(e)}
 
-    # 4. Conexión directa PostgreSQL por IP (asyncpg)
+    # 4. Resolución DNS via 8.8.8.8 (bypass DNS de Railway)
+    db_host = "aws-1-us-east-1.pooler.supabase.com"
+    try:
+        import dns.resolver
+        def _resolve_external():
+            resolver = dns.resolver.Resolver()
+            resolver.nameservers = ["8.8.8.8"]
+            answer = resolver.resolve(db_host, "A")
+            return [r.to_text() for r in answer]
+        ips = await asyncio.to_thread(_resolve_external)
+        results["dns_external_8888"] = {"ok": True, "host": db_host, "resolved": ips}
+    except Exception as e:
+        results["dns_external_8888"] = {"ok": False, "host": db_host, "error": str(e)}
+
+    # 5. Conexión directa PostgreSQL por IP (asyncpg)
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
