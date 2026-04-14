@@ -52,17 +52,16 @@ _resolved_db_ip: Optional[str] = None
 
 
 async def _resolve_db_host(dsn: str) -> tuple[dict, str]:
-    """Parse DSN, resolve hostname to IP via socket, return (conn_kwargs, resolved_ip)."""
+    """Parse DSN, use hardcoded IP (resolved via 8.8.8.8) to bypass Railway DNS block."""
     parsed = urllib.parse.urlparse(dsn)
-    host = parsed.hostname
     port = parsed.port or 5432
     user = parsed.username
     password = urllib.parse.unquote(parsed.password) if parsed.password else None
     database = parsed.path.lstrip("/")
 
-    addrs = await asyncio.to_thread(socket.getaddrinfo, host, port, socket.AF_INET)
-    ip = addrs[0][4][0]
-    print(f"✅ DB host {host} resuelto a {ip}")
+    # Railway blocks pooler.supabase.com DNS — use IP resolved via Google DNS 8.8.8.8
+    ip = "18.214.78.123"
+    print(f"✅ DB connecting via hardcoded IP {ip}")
 
     # SSL sin verificación de hostname (conectamos por IP, no por nombre)
     ssl_ctx = ssl.create_default_context()
