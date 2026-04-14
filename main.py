@@ -368,38 +368,42 @@ def root():
 async def health():
     results = {}
 
-    # Prueba internet general
+    # 1. Resolución DNS directa con socket
+    host = "lzxhrqfzpbyjyvoscjou.supabase.co"
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            r = await client.get("https://www.google.com")
+        addrs = await asyncio.to_thread(socket.getaddrinfo, host, 443)
+        resolved = [a[4][0] for a in addrs]
+        results["dns_socket"] = {"ok": True, "host": host, "resolved": resolved}
+        print(f"✅ DNS socket OK: {host} -> {resolved}")
+    except Exception as e:
+        results["dns_socket"] = {"ok": False, "host": host, "error": str(e)}
+        print(f"❌ DNS socket FAIL: {host} -> {e}")
+
+    # 2. HTTP a Google (internet general)
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get("https://google.com")
         results["google"] = {"ok": True, "status_code": r.status_code}
-        print(f"✅ Google alcanzable: {r.status_code}")
+        print(f"✅ Google OK: {r.status_code}")
     except Exception as e:
         results["google"] = {"ok": False, "error": str(e)}
-        print(f"❌ Google NO alcanzable: {e}")
+        print(f"❌ Google FAIL: {e}")
 
-    # Prueba Supabase (ping al proyecto)
-    sb_url = get_env("SUPABASE_URL") or "https://lzxhrqfzpbyjyvoscjou.supabase.co"
-    sb_key = get_env("SUPABASE_SERVICE_ROLE_KEY")
+    # 3. HTTP a Supabase (dominio específico)
     try:
-        headers = {"apikey": sb_key, "Authorization": f"Bearer {sb_key}"} if sb_key else {}
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            r = await client.get(
-                f"{sb_url}/rest/v1/usuarios",
-                headers=headers,
-                params={"select": "id", "limit": "1"},
-            )
-        results["supabase"] = {"ok": True, "status_code": r.status_code, "url": sb_url}
-        print(f"✅ Supabase alcanzable: {r.status_code}")
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"https://{host}")
+        results["supabase_http"] = {"ok": True, "status_code": r.status_code}
+        print(f"✅ Supabase HTTP OK: {r.status_code}")
     except Exception as e:
-        results["supabase"] = {"ok": False, "error": str(e), "url": sb_url}
-        print(f"❌ Supabase NO alcanzable ({sb_url}): {e}")
+        results["supabase_http"] = {"ok": False, "error": str(e)}
+        print(f"❌ Supabase HTTP FAIL: {e}")
 
     return {
         "status": "running",
         "time": time.time(),
         "service": "backend-suscripciones",
-        "connectivity": results,
+        "diagnostics": results,
     }
 
 
