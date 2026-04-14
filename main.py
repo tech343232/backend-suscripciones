@@ -47,48 +47,39 @@ def get_required_env(name: str) -> str:
 # =========================
 # CONNECTION POOL (asyncpg)
 # =========================
+# Railway blocks pooler.supabase.com DNS.
+# IP pre-resolved via Google DNS 8.8.8.8 (fallbacks: 3.227.209.82, 18.213.155.45)
+POOLER_IP = "18.214.78.123"
+
 _pool: Optional[asyncpg.Pool] = None
-_resolved_db_ip: Optional[str] = None
 
 
-async def _resolve_db_host(dsn: str) -> tuple[dict, str]:
-    """Parse DSN, use hardcoded IP (resolved via 8.8.8.8) to bypass Railway DNS block."""
+def _build_conn_kwargs() -> dict:
+    """Parse DATABASE_URL and return asyncpg kwargs using hardcoded pooler IP."""
+    dsn = get_required_env("DATABASE_URL")
     parsed = urllib.parse.urlparse(dsn)
-    port = parsed.port or 5432
-    user = parsed.username
-    password = urllib.parse.unquote(parsed.password) if parsed.password else None
-    database = parsed.path.lstrip("/")
-
-    # Railway blocks pooler.supabase.com DNS — use IP resolved via Google DNS 8.8.8.8
-    ip = "18.214.78.123"
-    print(f"✅ DB connecting via hardcoded IP {ip}")
-
-    # SSL sin verificación de hostname (conectamos por IP, no por nombre)
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
-
-    conn_kwargs = {
-        "host": ip,
-        "port": port,
-        "user": user,
-        "password": password,
-        "database": database,
+    return {
+        "host": POOLER_IP,
+        "port": parsed.port or 5432,
+        "user": parsed.username,
+        "password": urllib.parse.unquote(parsed.password) if parsed.password else None,
+        "database": parsed.path.lstrip("/"),
         "min_size": 1,
         "max_size": 10,
         "command_timeout": 30,
         "ssl": ssl_ctx,
     }
-    return conn_kwargs, ip
 
 
 async def get_pool() -> asyncpg.Pool:
-    global _pool, _resolved_db_ip
+    global _pool
     if _pool is None:
-        dsn = get_required_env("DATABASE_URL")
-        conn_kwargs, ip = await _resolve_db_host(dsn)
-        _resolved_db_ip = ip
-        _pool = await asyncpg.create_pool(**conn_kwargs)
+        kwargs = _build_conn_kwargs()
+        print(f"✅ DB connecting via hardcoded IP {POOLER_IP}")
+        _pool = await asyncpg.create_pool(**kwargs)
     return _pool
 
 
@@ -446,13 +437,13 @@ async def health():
         results["postgres_direct"] = {
             "ok": True,
             "select_1": val,
-            "resolved_ip": _resolved_db_ip,
+            "resolved_ip": POOLER_IP,
         }
     except Exception as e:
         results["postgres_direct"] = {
             "ok": False,
             "error": str(e),
-            "resolved_ip": _resolved_db_ip,
+            "resolved_ip": POOLER_IP,
         }
 
     return {
