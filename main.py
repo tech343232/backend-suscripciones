@@ -4,7 +4,6 @@ import hashlib
 import socket
 import ssl
 import time
-import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
@@ -55,18 +54,16 @@ _pool: Optional[asyncpg.Pool] = None
 
 
 def _build_conn_kwargs() -> dict:
-    """Parse DATABASE_URL and return asyncpg kwargs using hardcoded pooler IP."""
-    dsn = get_required_env("DATABASE_URL")
-    parsed = urllib.parse.urlparse(dsn)
+    """Build asyncpg kwargs from individual env vars (avoids special-char issues in URLs)."""
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
     return {
         "host": POOLER_IP,
-        "port": parsed.port or 5432,
-        "user": parsed.username,
-        "password": urllib.parse.unquote(parsed.password) if parsed.password else None,
-        "database": parsed.path.lstrip("/"),
+        "port": 5432,
+        "user": "postgres.lzxhrqfzpbyjyvoscjou",
+        "password": get_required_env("DB_PASSWORD"),
+        "database": "postgres",
         "min_size": 1,
         "max_size": 10,
         "command_timeout": 30,
@@ -459,7 +456,7 @@ async def config_check():
     checks = {
         "STRIPE_SECRET_KEY": bool(get_env("STRIPE_SECRET_KEY")),
         "STRIPE_WEBHOOK_SECRET": bool(get_env("STRIPE_WEBHOOK_SECRET")),
-        "DATABASE_URL": bool(get_env("DATABASE_URL")),
+        "DB_PASSWORD": bool(get_env("DB_PASSWORD")),
         "APP_URL": bool(get_env("APP_URL")),
         "PRICE_ID_BASICO": bool(get_env("PRICE_ID_BASICO")),
         "PRICE_ID_PROFESIONAL": bool(get_env("PRICE_ID_PROFESIONAL")),
