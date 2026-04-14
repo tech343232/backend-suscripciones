@@ -1,7 +1,10 @@
 import asyncio
 import os
 import hashlib
+import socket
+import ssl
 import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
@@ -45,13 +48,48 @@ def get_required_env(name: str) -> str:
 # CONNECTION POOL (asyncpg)
 # =========================
 _pool: Optional[asyncpg.Pool] = None
+_resolved_db_ip: Optional[str] = None
+
+
+async def _resolve_db_host(dsn: str) -> tuple[dict, str]:
+    """Parse DSN, resolve hostname to IP via socket, return (conn_kwargs, resolved_ip)."""
+    parsed = urllib.parse.urlparse(dsn)
+    host = parsed.hostname
+    port = parsed.port or 5432
+    user = parsed.username
+    password = urllib.parse.unquote(parsed.password) if parsed.password else None
+    database = parsed.path.lstrip("/")
+
+    addrs = await asyncio.to_thread(socket.getaddrinfo, host, port, socket.AF_INET)
+    ip = addrs[0][4][0]
+    print(f"✅ DB host {host} resuelto a {ip}")
+
+    # SSL sin verificación de hostname (conectamos por IP, no por nombre)
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+
+    conn_kwargs = {
+        "host": ip,
+        "port": port,
+        "user": user,
+        "password": password,
+        "database": database,
+        "min_size": 1,
+        "max_size": 10,
+        "command_timeout": 30,
+        "ssl": ssl_ctx,
+    }
+    return conn_kwargs, ip
 
 
 async def get_pool() -> asyncpg.Pool:
-    global _pool
+    global _pool, _resolved_db_ip
     if _pool is None:
         dsn = get_required_env("DATABASE_URL")
-        _pool = await asyncpg.create_pool(dsn, min_size=1, max_size=10, command_timeout=30)
+        conn_kwargs, ip = await _resolve_db_host(dsn)
+        _resolved_db_ip = ip
+        _pool = await asyncpg.create_pool(**conn_kwargs)
     return _pool
 
 
@@ -360,7 +398,6 @@ def root():
 
 @app.get("/health")
 async def health():
-    import socket
     results = {}
     host = "lzxhrqfzpbyjyvoscjou.supabase.co"
 
@@ -388,14 +425,22 @@ async def health():
     except Exception as e:
         results["supabase_http"] = {"ok": False, "error": str(e)}
 
-    # 4. Conexión directa PostgreSQL (asyncpg)
+    # 4. Conexión directa PostgreSQL por IP (asyncpg)
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
             val = await conn.fetchval("SELECT 1")
-        results["postgres_direct"] = {"ok": True, "select_1": val}
+        results["postgres_direct"] = {
+            "ok": True,
+            "select_1": val,
+            "resolved_ip": _resolved_db_ip,
+        }
     except Exception as e:
-        results["postgres_direct"] = {"ok": False, "error": str(e)}
+        results["postgres_direct"] = {
+            "ok": False,
+            "error": str(e),
+            "resolved_ip": _resolved_db_ip,
+        }
 
     return {
         "status": "running",
