@@ -1,23 +1,16 @@
-import socket
-_original_getaddrinfo = socket.getaddrinfo
-def patched_getaddrinfo(host, port, *args, **kwargs):
-    return _original_getaddrinfo(host, port, *args, **kwargs)
-socket.getaddrinfo = patched_getaddrinfo
-
 import asyncio
 import os
 import hashlib
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
+import asyncpg
 import httpx
 import stripe
 from fastapi import BackgroundTasks, FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-
-
-app = FastAPI(title="Backend Suscripciones", version="3.0.0")
 
 
 # =========================
@@ -49,24 +42,42 @@ def get_required_env(name: str) -> str:
 
 
 # =========================
-# SUPABASE ASYNC (httpx directo, sin supabase-py)
+# CONNECTION POOL (asyncpg)
 # =========================
-def _sb_base() -> str:
-    return get_required_env("SUPABASE_URL") + "/rest/v1"
+_pool: Optional[asyncpg.Pool] = None
 
 
-def _sb_headers() -> Dict[str, str]:
-    key = get_required_env("SUPABASE_SERVICE_ROLE_KEY")
-    return {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "Prefer": "return=representation",
-    }
+async def get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        dsn = get_required_env("DATABASE_URL")
+        _pool = await asyncpg.create_pool(dsn, min_size=1, max_size=10, command_timeout=30)
+    return _pool
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Inicializar pool al arrancar
+    try:
+        await get_pool()
+        print("✅ Pool PostgreSQL inicializado")
+    except Exception as e:
+        print(f"⚠️ No se pudo inicializar el pool al arrancar: {e}")
+    yield
+    # Cerrar pool al apagar
+    global _pool
+    if _pool:
+        await _pool.close()
+        print("Pool PostgreSQL cerrado")
+
+
+app = FastAPI(title="Backend Suscripciones", version="4.0.0", lifespan=lifespan)
+
+
+# =========================
+# RETRY HELPER
+# =========================
 async def _async_retry(coro_fn, max_retries: int = 7, base_delay: float = 5.0, max_delay: float = 60.0):
-    """Ejecuta coro_fn() con reintentos async ante errores de red/DNS."""
     last_exc = None
     for attempt in range(max_retries):
         try:
@@ -83,6 +94,8 @@ async def _async_retry(coro_fn, max_retries: int = 7, base_delay: float = 5.0, m
                 "temporary failure in name resolution",
                 "network unreachable",
                 "failed to establish",
+                "connection terminated",
+                "too many clients",
             ))
             if is_network and attempt < max_retries - 1:
                 delay = min(base_delay * (2 ** attempt), max_delay)
@@ -93,6 +106,9 @@ async def _async_retry(coro_fn, max_retries: int = 7, base_delay: float = 5.0, m
     raise last_exc
 
 
+# =========================
+# STRIPE HELPERS
+# =========================
 def get_stripe_ready():
     stripe.api_key = get_required_env("STRIPE_SECRET_KEY")
 
@@ -206,7 +222,7 @@ def resolve_plan_from_price_id(price_id: Optional[str]) -> Dict[str, Any]:
 
 
 # =========================
-# HELPERS DB (async, httpx directo)
+# HELPERS DB (asyncpg directo)
 # =========================
 async def upsert_user_by_email(
     email: str,
@@ -219,46 +235,45 @@ async def upsert_user_by_email(
     plan: Optional[str] = None,
     contact_limit: Optional[int] = None,
 ) -> None:
-    data: Dict[str, Any] = {"updated_at": now_iso()}
-    if customer_id is not None:
-        data["stripe_customer_id"] = customer_id
-    if subscription_id is not None:
-        data["stripe_subscription_id"] = subscription_id
-    if status is not None:
-        data["subscription_status"] = status
-    if access_active is not None:
-        data["access_active"] = access_active
-    if price_id is not None:
-        data["price_id"] = price_id
-    if current_period_end is not None:
-        data["current_period_end"] = current_period_end
-    if plan is not None:
-        data["plan"] = plan
-    if contact_limit is not None:
-        data["contact_limit"] = contact_limit
-
     async def _do():
-        base = _sb_base()
-        headers = _sb_headers()
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.get(
-                f"{base}/usuarios",
-                headers=headers,
-                params={"select": "id", "email": f"eq.{email}"},
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id FROM usuarios WHERE email = $1", email
             )
-            r.raise_for_status()
-            if r.json():
-                r2 = await client.patch(
-                    f"{base}/usuarios",
-                    headers=headers,
-                    params={"email": f"eq.{email}"},
-                    json=data,
+            ts = now_iso()
+            if row:
+                await conn.execute(
+                    """
+                    UPDATE usuarios SET
+                        updated_at            = $1,
+                        stripe_customer_id    = COALESCE($2, stripe_customer_id),
+                        stripe_subscription_id= COALESCE($3, stripe_subscription_id),
+                        subscription_status   = COALESCE($4, subscription_status),
+                        access_active         = COALESCE($5, access_active),
+                        price_id              = COALESCE($6, price_id),
+                        current_period_end    = COALESCE($7, current_period_end),
+                        plan                  = COALESCE($8, plan),
+                        contact_limit         = COALESCE($9, contact_limit)
+                    WHERE email = $10
+                    """,
+                    ts, customer_id, subscription_id, status, access_active,
+                    price_id, current_period_end, plan, contact_limit, email,
                 )
-                r2.raise_for_status()
             else:
-                row = {**data, "email": email, "created_at": now_iso(), "contacts_used": 0}
-                r2 = await client.post(f"{base}/usuarios", headers=headers, json=row)
-                r2.raise_for_status()
+                await conn.execute(
+                    """
+                    INSERT INTO usuarios
+                        (email, created_at, updated_at, contacts_used,
+                         stripe_customer_id, stripe_subscription_id,
+                         subscription_status, access_active, price_id,
+                         current_period_end, plan, contact_limit)
+                    VALUES ($1,$2,$3,0,$4,$5,$6,$7,$8,$9,$10,$11)
+                    """,
+                    email, ts, ts,
+                    customer_id, subscription_id, status, access_active,
+                    price_id, current_period_end, plan, contact_limit,
+                )
 
     await _async_retry(_do)
 
@@ -273,66 +288,49 @@ async def update_user_by_customer_id(
     plan: Optional[str] = None,
     contact_limit: Optional[int] = None,
 ) -> None:
-    data: Dict[str, Any] = {"updated_at": now_iso()}
-    if status is not None:
-        data["subscription_status"] = status
-    if subscription_id is not None:
-        data["stripe_subscription_id"] = subscription_id
-    if access_active is not None:
-        data["access_active"] = access_active
-    if price_id is not None:
-        data["price_id"] = price_id
-    if current_period_end is not None:
-        data["current_period_end"] = current_period_end
-    if plan is not None:
-        data["plan"] = plan
-    if contact_limit is not None:
-        data["contact_limit"] = contact_limit
-
     async def _do():
-        base = _sb_base()
-        headers = _sb_headers()
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.patch(
-                f"{base}/usuarios",
-                headers=headers,
-                params={"stripe_customer_id": f"eq.{customer_id}"},
-                json=data,
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE usuarios SET
+                    updated_at            = $1,
+                    subscription_status   = COALESCE($2, subscription_status),
+                    stripe_subscription_id= COALESCE($3, stripe_subscription_id),
+                    access_active         = COALESCE($4, access_active),
+                    price_id              = COALESCE($5, price_id),
+                    current_period_end    = COALESCE($6, current_period_end),
+                    plan                  = COALESCE($7, plan),
+                    contact_limit         = COALESCE($8, contact_limit)
+                WHERE stripe_customer_id = $9
+                """,
+                now_iso(), status, subscription_id, access_active,
+                price_id, current_period_end, plan, contact_limit, customer_id,
             )
-            r.raise_for_status()
 
     await _async_retry(_do)
 
 
 async def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     async def _do():
-        base = _sb_base()
-        headers = _sb_headers()
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.get(
-                f"{base}/usuarios",
-                headers=headers,
-                params={"select": "*", "email": f"eq.{email}", "limit": "1"},
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM usuarios WHERE email = $1 LIMIT 1", email
             )
-            r.raise_for_status()
-            rows = r.json()
-            return rows[0] if rows else None
+            return dict(row) if row else None
 
     return await _async_retry(_do)
 
 
 async def count_user_contacts(user_id: str) -> int:
     async def _do():
-        base = _sb_base()
-        headers = _sb_headers()
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.get(
-                f"{base}/contacts",
-                headers=headers,
-                params={"select": "id", "user_id": f"eq.{user_id}"},
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            val = await conn.fetchval(
+                "SELECT COUNT(*) FROM contacts WHERE user_id = $1", user_id
             )
-            r.raise_for_status()
-            return len(r.json())
+            return int(val)
 
     return await _async_retry(_do)
 
@@ -341,16 +339,12 @@ async def sync_contacts_used(user_id: str) -> int:
     total = await count_user_contacts(user_id)
 
     async def _do():
-        base = _sb_base()
-        headers = _sb_headers()
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.patch(
-                f"{base}/usuarios",
-                headers=headers,
-                params={"id": f"eq.{user_id}"},
-                json={"contacts_used": total, "updated_at": now_iso()},
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE usuarios SET contacts_used = $1, updated_at = $2 WHERE id = $3",
+                total, now_iso(), user_id,
             )
-            r.raise_for_status()
 
     await _async_retry(_do)
     return total
@@ -366,38 +360,42 @@ def root():
 
 @app.get("/health")
 async def health():
+    import socket
     results = {}
+    host = "lzxhrqfzpbyjyvoscjou.supabase.co"
 
     # 1. Resolución DNS directa con socket
-    host = "lzxhrqfzpbyjyvoscjou.supabase.co"
     try:
         addrs = await asyncio.to_thread(socket.getaddrinfo, host, 443)
         resolved = [a[4][0] for a in addrs]
         results["dns_socket"] = {"ok": True, "host": host, "resolved": resolved}
-        print(f"✅ DNS socket OK: {host} -> {resolved}")
     except Exception as e:
         results["dns_socket"] = {"ok": False, "host": host, "error": str(e)}
-        print(f"❌ DNS socket FAIL: {host} -> {e}")
 
     # 2. HTTP a Google (internet general)
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.get("https://google.com")
         results["google"] = {"ok": True, "status_code": r.status_code}
-        print(f"✅ Google OK: {r.status_code}")
     except Exception as e:
         results["google"] = {"ok": False, "error": str(e)}
-        print(f"❌ Google FAIL: {e}")
 
     # 3. HTTP a Supabase (dominio específico)
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.get(f"https://{host}")
         results["supabase_http"] = {"ok": True, "status_code": r.status_code}
-        print(f"✅ Supabase HTTP OK: {r.status_code}")
     except Exception as e:
         results["supabase_http"] = {"ok": False, "error": str(e)}
-        print(f"❌ Supabase HTTP FAIL: {e}")
+
+    # 4. Conexión directa PostgreSQL (asyncpg)
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            val = await conn.fetchval("SELECT 1")
+        results["postgres_direct"] = {"ok": True, "select_1": val}
+    except Exception as e:
+        results["postgres_direct"] = {"ok": False, "error": str(e)}
 
     return {
         "status": "running",
@@ -412,8 +410,7 @@ async def config_check():
     checks = {
         "STRIPE_SECRET_KEY": bool(get_env("STRIPE_SECRET_KEY")),
         "STRIPE_WEBHOOK_SECRET": bool(get_env("STRIPE_WEBHOOK_SECRET")),
-        "SUPABASE_URL": bool(get_env("SUPABASE_URL")),
-        "SUPABASE_SERVICE_ROLE_KEY": bool(get_env("SUPABASE_SERVICE_ROLE_KEY")),
+        "DATABASE_URL": bool(get_env("DATABASE_URL")),
         "APP_URL": bool(get_env("APP_URL")),
         "PRICE_ID_BASICO": bool(get_env("PRICE_ID_BASICO")),
         "PRICE_ID_PROFESIONAL": bool(get_env("PRICE_ID_PROFESIONAL")),
@@ -422,25 +419,21 @@ async def config_check():
         "META_ACCESS_TOKEN": bool(get_env("META_ACCESS_TOKEN")),
     }
 
-    supabase_ok = False
-    supabase_error = None
+    db_ok = False
+    db_error = None
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(
-                f"{_sb_base()}/usuarios",
-                headers=_sb_headers(),
-                params={"select": "id", "limit": "1"},
-            )
-            r.raise_for_status()
-            supabase_ok = True
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        db_ok = True
     except Exception as e:
-        supabase_error = str(e)
+        db_error = str(e)
 
     return {
         "ok": True,
         "env": checks,
-        "supabase_connected": supabase_ok,
-        "supabase_error": supabase_error,
+        "db_connected": db_ok,
+        "db_error": db_error,
     }
 
 
@@ -530,22 +523,20 @@ async def create_contact(request: Request):
         )
 
     async def _do_insert():
-        base = _sb_base()
-        headers = _sb_headers()
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(
-                f"{base}/contacts",
-                headers=headers,
-                json={
-                    "user_id": user_id,
-                    "name": name,
-                    "phone": phone if phone else None,
-                    "notes": notes if notes else None,
-                },
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO contacts (user_id, name, phone, notes)
+                VALUES ($1, $2, $3, $4)
+                RETURNING *
+                """,
+                user_id,
+                name,
+                phone if phone else None,
+                notes if notes else None,
             )
-            r.raise_for_status()
-            rows = r.json()
-            return rows[0] if rows else None
+            return dict(row) if row else None
 
     insert_result = await _async_retry(_do_insert)
     updated_contacts = await sync_contacts_used(user_id)
@@ -590,7 +581,6 @@ async def my_plan(email: str):
 # WEBHOOK STRIPE
 # =========================
 async def _process_stripe_event(event: Dict[str, Any]) -> None:
-    """Procesa el evento de Stripe en segundo plano para no bloquear la respuesta a Stripe."""
     event_type = event["type"]
     obj = event["data"]["object"]
     print("Evento recibido:", event_type)
@@ -744,6 +734,5 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Firma inválida")
 
-    # Responde 200 de inmediato a Stripe y procesa en segundo plano
     background_tasks.add_task(_process_stripe_event, event)
     return JSONResponse({"received": True})
