@@ -250,12 +250,14 @@ async def upsert_user_by_email(
     async def _do():
         pool = await get_pool()
         async with pool.acquire() as conn:
+            print(f"[upsert] looking up email={email}")
             row = await conn.fetchrow(
                 "SELECT id FROM usuarios WHERE email = $1", email
             )
             ts = now_iso()
             if row:
-                await conn.execute(
+                print(f"[upsert] existing user id={row['id']} — running UPDATE")
+                result = await conn.execute(
                     """
                     UPDATE usuarios SET
                         updated_at            = $1,
@@ -272,8 +274,10 @@ async def upsert_user_by_email(
                     ts, customer_id, subscription_id, status, access_active,
                     price_id, current_period_end, plan, contact_limit, email,
                 )
+                print(f"[upsert] UPDATE result: {result}")
             else:
-                await conn.execute(
+                print(f"[upsert] no existing user — running INSERT for email={email}")
+                result = await conn.execute(
                     """
                     INSERT INTO usuarios
                         (email, created_at, updated_at, contacts_used,
@@ -286,6 +290,7 @@ async def upsert_user_by_email(
                     customer_id, subscription_id, status, access_active,
                     price_id, current_period_end, plan, contact_limit,
                 )
+                print(f"[upsert] INSERT result: {result}")
 
     await _async_retry(_do)
 
@@ -624,7 +629,12 @@ async def _process_stripe_event(event: Dict[str, Any]) -> None:
             subscription_id = obj.get("subscription")
             email = get_customer_email_from_session(obj)
 
+            print(f"[checkout.completed] customer_id={customer_id} subscription_id={subscription_id} email={email}")
+            print(f"[checkout.completed] customer_details={obj.get('customer_details')} metadata={obj.get('metadata')}")
+
             subscription = await asyncio.to_thread(get_subscription, subscription_id)
+            print(f"[checkout.completed] subscription fetched: {subscription is not None}, status={subscription.get('status') if subscription else 'N/A'}")
+
             status = subscription.get("status") if subscription else "active"
             current_period_end = unix_to_iso(subscription.get("current_period_end")) if subscription else None
 
@@ -637,8 +647,10 @@ async def _process_stripe_event(event: Dict[str, Any]) -> None:
                 resolved_price_id = obj.get("metadata", {}).get("price_id")
 
             plan_info = resolve_plan_from_price_id(resolved_price_id)
+            print(f"[checkout.completed] resolved_price_id={resolved_price_id} plan_info={plan_info}")
 
             if email:
+                print(f"[checkout.completed] calling upsert_user_by_email for {email}")
                 await upsert_user_by_email(
                     email=email,
                     customer_id=customer_id,
@@ -650,7 +662,9 @@ async def _process_stripe_event(event: Dict[str, Any]) -> None:
                     plan=plan_info["plan"],
                     contact_limit=plan_info["contact_limit"],
                 )
+                print(f"[checkout.completed] upsert_user_by_email OK for {email}")
             elif customer_id:
+                print(f"[checkout.completed] no email — calling update_user_by_customer_id for {customer_id}")
                 await update_user_by_customer_id(
                     customer_id=customer_id,
                     status=status,
@@ -661,6 +675,9 @@ async def _process_stripe_event(event: Dict[str, Any]) -> None:
                     plan=plan_info["plan"],
                     contact_limit=plan_info["contact_limit"],
                 )
+                print(f"[checkout.completed] update_user_by_customer_id OK for {customer_id}")
+            else:
+                print("[checkout.completed] ⚠️ no email and no customer_id — nothing written to DB")
 
             amount_total = (obj.get("amount_total") or 0) / 100
             currency = (obj.get("currency") or "usd").upper()
