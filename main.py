@@ -61,7 +61,7 @@ def _build_conn_kwargs() -> dict:
     return {
         "host": POOLER_IP,
         "port": 5432,
-        "user": "postgres.lzxhrqfzpbyjyvoscjou",
+        "user": "postgres.lxzhrqfzpbyjvyoscjou",
         "password": get_required_env("DB_PASSWORD"),
         "database": "postgres",
         "min_size": 1,
