@@ -299,11 +299,11 @@ async def upsert_user_by_email(
                 result = await conn.execute(
                     """
                     INSERT INTO usuarios
-                        (email, created_at, updated_at, contacts_used,
+                        (id, email, created_at, updated_at, contacts_used,
                          stripe_customer_id, stripe_subscription_id,
                          subscription_status, access_active, price_id,
                          current_period_end, plan, contact_limit)
-                    VALUES ($1, NOW(), NOW(), 0, $2, $3, $4, $5, $6, $7::text::timestamptz, $8, $9::int)
+                    VALUES (gen_random_uuid(), $1, NOW(), NOW(), 0, $2, $3, $4, $5, $6, $7::text::timestamptz, $8, $9::int)
                     """,
                     email,
                     customer_id, subscription_id, status, access_active,
