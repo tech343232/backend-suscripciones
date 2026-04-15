@@ -285,7 +285,7 @@ async def upsert_user_by_email(
                         subscription_status   = COALESCE($3, subscription_status),
                         access_active         = COALESCE($4, access_active),
                         price_id              = COALESCE($5, price_id),
-                        current_period_end    = COALESCE($6::timestamptz, current_period_end),
+                        current_period_end    = COALESCE($6, current_period_end),
                         plan                  = COALESCE($7, plan),
                         contact_limit         = COALESCE($8, contact_limit)
                     WHERE email = $9
@@ -303,7 +303,7 @@ async def upsert_user_by_email(
                          stripe_customer_id, stripe_subscription_id,
                          subscription_status, access_active, price_id,
                          current_period_end, plan, contact_limit)
-                    VALUES ($1, NOW(), NOW(), 0, $2, $3, $4, $5, $6, $7::timestamptz, $8, $9)
+                    VALUES ($1, NOW(), NOW(), 0, $2, $3, $4, $5, $6, $7, $8, $9)
                     """,
                     email,
                     customer_id, subscription_id, status, access_active,
