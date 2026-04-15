@@ -273,35 +273,25 @@ async def upsert_user_by_email(
             row = await conn.fetchrow(
                 "SELECT id FROM usuarios WHERE email = $1", email
             )
-            # Fechas como objetos datetime — asyncpg rechaza strings
-            ts: datetime = datetime.now(timezone.utc)
-            period_end_dt: Optional[datetime] = (
-                datetime.fromisoformat(current_period_end).replace(tzinfo=timezone.utc)
-                if current_period_end and isinstance(current_period_end, str)
-                else current_period_end
-                if isinstance(current_period_end, datetime)
-                else None
-            )
-            print(f"[upsert] ts type={type(ts).__name__} value={ts.isoformat()}")
-            print(f"[upsert] period_end_dt type={type(period_end_dt).__name__} value={period_end_dt}")
+            print(f"[upsert] current_period_end={current_period_end!r}")
             if row:
                 print(f"[upsert] existing user id={row['id']} — running UPDATE")
                 result = await conn.execute(
                     """
                     UPDATE usuarios SET
-                        updated_at            = $1,
-                        stripe_customer_id    = COALESCE($2, stripe_customer_id),
-                        stripe_subscription_id= COALESCE($3, stripe_subscription_id),
-                        subscription_status   = COALESCE($4, subscription_status),
-                        access_active         = COALESCE($5, access_active),
-                        price_id              = COALESCE($6, price_id),
-                        current_period_end    = COALESCE($7, current_period_end),
-                        plan                  = COALESCE($8, plan),
-                        contact_limit         = COALESCE($9, contact_limit)
-                    WHERE email = $10
+                        updated_at            = NOW(),
+                        stripe_customer_id    = COALESCE($1, stripe_customer_id),
+                        stripe_subscription_id= COALESCE($2, stripe_subscription_id),
+                        subscription_status   = COALESCE($3, subscription_status),
+                        access_active         = COALESCE($4, access_active),
+                        price_id              = COALESCE($5, price_id),
+                        current_period_end    = COALESCE($6::timestamptz, current_period_end),
+                        plan                  = COALESCE($7, plan),
+                        contact_limit         = COALESCE($8, contact_limit)
+                    WHERE email = $9
                     """,
-                    ts, customer_id, subscription_id, status, access_active,
-                    price_id, period_end_dt, plan, contact_limit, email,
+                    customer_id, subscription_id, status, access_active,
+                    price_id, current_period_end, plan, contact_limit, email,
                 )
                 print(f"[upsert] UPDATE result: {result}")
             else:
@@ -313,11 +303,11 @@ async def upsert_user_by_email(
                          stripe_customer_id, stripe_subscription_id,
                          subscription_status, access_active, price_id,
                          current_period_end, plan, contact_limit)
-                    VALUES ($1,$2,$3,0,$4,$5,$6,$7,$8,$9,$10,$11)
+                    VALUES ($1, NOW(), NOW(), 0, $2, $3, $4, $5, $6, $7::timestamptz, $8, $9)
                     """,
-                    email, ts, ts,
+                    email,
                     customer_id, subscription_id, status, access_active,
-                    price_id, period_end_dt, plan, contact_limit,
+                    price_id, current_period_end, plan, contact_limit,
                 )
                 print(f"[upsert] INSERT result: {result}")
 
@@ -340,18 +330,18 @@ async def update_user_by_customer_id(
             await conn.execute(
                 """
                 UPDATE usuarios SET
-                    updated_at            = $1,
-                    subscription_status   = COALESCE($2, subscription_status),
-                    stripe_subscription_id= COALESCE($3, stripe_subscription_id),
-                    access_active         = COALESCE($4, access_active),
-                    price_id              = COALESCE($5, price_id),
-                    current_period_end    = COALESCE($6, current_period_end),
-                    plan                  = COALESCE($7, plan),
-                    contact_limit         = COALESCE($8, contact_limit)
-                WHERE stripe_customer_id = $9
+                    updated_at            = NOW(),
+                    subscription_status   = COALESCE($1, subscription_status),
+                    stripe_subscription_id= COALESCE($2, stripe_subscription_id),
+                    access_active         = COALESCE($3, access_active),
+                    price_id              = COALESCE($4, price_id),
+                    current_period_end    = COALESCE($5::timestamptz, current_period_end),
+                    plan                  = COALESCE($6, plan),
+                    contact_limit         = COALESCE($7, contact_limit)
+                WHERE stripe_customer_id = $8
                 """,
-                now_dt(), status, subscription_id, access_active,
-                price_id, iso_to_dt(current_period_end), plan, contact_limit, customer_id,
+                status, subscription_id, access_active,
+                price_id, current_period_end, plan, contact_limit, customer_id,
             )
 
     await _async_retry(_do)
@@ -388,8 +378,8 @@ async def sync_contacts_used(user_id: str) -> int:
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
-                "UPDATE usuarios SET contacts_used = $1, updated_at = $2 WHERE id = $3",
-                total, now_dt(), user_id,
+                "UPDATE usuarios SET contacts_used = $1, updated_at = NOW() WHERE id = $2",
+                total, user_id,
             )
 
     await _async_retry(_do)
