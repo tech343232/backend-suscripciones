@@ -46,37 +46,24 @@ def get_required_env(name: str) -> str:
 # =========================
 # CONNECTION POOL (asyncpg)
 # =========================
-# Railway blocks pooler.supabase.com DNS.
-# IP pre-resolved via Google DNS 8.8.8.8 (fallbacks: 3.227.209.82, 18.213.155.45)
-POOLER_IP = "18.214.78.123"
-
 _pool: Optional[asyncpg.Pool] = None
-
-
-def _build_conn_kwargs() -> dict:
-    """Build asyncpg kwargs from individual env vars (avoids special-char issues in URLs)."""
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-    return {
-        "host": POOLER_IP,
-        "port": 5432,
-        "user": "postgres.lxzhrqfzpbyjvyoscjou",
-        "password": get_required_env("DB_PASSWORD"),
-        "database": "postgres",
-        "min_size": 1,
-        "max_size": 10,
-        "command_timeout": 30,
-        "ssl": ssl_ctx,
-    }
 
 
 async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
-        kwargs = _build_conn_kwargs()
-        print(f"✅ DB connecting via hardcoded IP {POOLER_IP}")
-        _pool = await asyncpg.create_pool(**kwargs)
+        dsn = get_required_env("DATABASE_URL")
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        print("✅ DB connecting via DATABASE_URL")
+        _pool = await asyncpg.create_pool(
+            dsn,
+            min_size=1,
+            max_size=10,
+            command_timeout=30,
+            ssl=ssl_ctx,
+        )
     return _pool
 
 
@@ -434,13 +421,13 @@ async def health():
         results["postgres_direct"] = {
             "ok": True,
             "select_1": val,
-            "resolved_ip": POOLER_IP,
+            "database_url_set": bool(get_env("DATABASE_URL")),
         }
     except Exception as e:
         results["postgres_direct"] = {
             "ok": False,
             "error": str(e),
-            "resolved_ip": POOLER_IP,
+            "database_url_set": bool(get_env("DATABASE_URL")),
         }
 
     return {
