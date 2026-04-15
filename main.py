@@ -39,7 +39,7 @@ def unix_to_iso(timestamp: Optional[int]) -> Optional[str]:
 def get_required_env(name: str) -> str:
     value = get_env(name)
     if not value:
-        raise HTTPException(status_code=500, detail=f"Falta variable de entorno: {name}")
+        raise RuntimeError(f"Falta variable de entorno: {name}")
     return value
 
 
@@ -224,12 +224,17 @@ def get_subscription(subscription_id: Optional[str]) -> Optional[Dict[str, Any]]
 
 def resolve_plan_from_price_id(price_id: Optional[str]) -> Dict[str, Any]:
     price_map = get_price_map()
+    print(f"[resolve_plan] incoming price_id={price_id!r}")
+    print(f"[resolve_plan] known price_ids={list(price_map.keys())}")
     if price_id and price_id in price_map:
-        return {
+        result = {
             "price_id": price_id,
             "plan": price_map[price_id]["plan"],
             "contact_limit": price_map[price_id]["contact_limit"],
         }
+        print(f"[resolve_plan] matched → {result}")
+        return result
+    print(f"[resolve_plan] ⚠️ no match — plan will be None")
     return {"price_id": price_id, "plan": None, "contact_limit": 0}
 
 
