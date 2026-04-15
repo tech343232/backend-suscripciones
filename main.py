@@ -26,6 +26,20 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def now_dt() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso_to_dt(value: Optional[str]) -> Optional[datetime]:
+    """Convert ISO string to timezone-aware datetime for asyncpg, or None."""
+    if not value:
+        return None
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def sha256_value(value: str) -> str:
     return hashlib.sha256(value.strip().lower().encode("utf-8")).hexdigest()
 
@@ -259,7 +273,8 @@ async def upsert_user_by_email(
             row = await conn.fetchrow(
                 "SELECT id FROM usuarios WHERE email = $1", email
             )
-            ts = now_iso()
+            ts = now_dt()
+            period_end_dt = iso_to_dt(current_period_end)
             if row:
                 print(f"[upsert] existing user id={row['id']} — running UPDATE")
                 result = await conn.execute(
@@ -277,7 +292,7 @@ async def upsert_user_by_email(
                     WHERE email = $10
                     """,
                     ts, customer_id, subscription_id, status, access_active,
-                    price_id, current_period_end, plan, contact_limit, email,
+                    price_id, period_end_dt, plan, contact_limit, email,
                 )
                 print(f"[upsert] UPDATE result: {result}")
             else:
@@ -293,7 +308,7 @@ async def upsert_user_by_email(
                     """,
                     email, ts, ts,
                     customer_id, subscription_id, status, access_active,
-                    price_id, current_period_end, plan, contact_limit,
+                    price_id, period_end_dt, plan, contact_limit,
                 )
                 print(f"[upsert] INSERT result: {result}")
 
@@ -326,8 +341,8 @@ async def update_user_by_customer_id(
                     contact_limit         = COALESCE($8, contact_limit)
                 WHERE stripe_customer_id = $9
                 """,
-                now_iso(), status, subscription_id, access_active,
-                price_id, current_period_end, plan, contact_limit, customer_id,
+                now_dt(), status, subscription_id, access_active,
+                price_id, iso_to_dt(current_period_end), plan, contact_limit, customer_id,
             )
 
     await _async_retry(_do)
@@ -365,7 +380,7 @@ async def sync_contacts_used(user_id: str) -> int:
         async with pool.acquire() as conn:
             await conn.execute(
                 "UPDATE usuarios SET contacts_used = $1, updated_at = $2 WHERE id = $3",
-                total, now_iso(), user_id,
+                total, now_dt(), user_id,
             )
 
     await _async_retry(_do)
