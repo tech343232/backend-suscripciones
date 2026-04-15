@@ -273,8 +273,17 @@ async def upsert_user_by_email(
             row = await conn.fetchrow(
                 "SELECT id FROM usuarios WHERE email = $1", email
             )
-            ts = now_dt()
-            period_end_dt = iso_to_dt(current_period_end)
+            # Fechas como objetos datetime — asyncpg rechaza strings
+            ts: datetime = datetime.now(timezone.utc)
+            period_end_dt: Optional[datetime] = (
+                datetime.fromisoformat(current_period_end).replace(tzinfo=timezone.utc)
+                if current_period_end and isinstance(current_period_end, str)
+                else current_period_end
+                if isinstance(current_period_end, datetime)
+                else None
+            )
+            print(f"[upsert] ts type={type(ts).__name__} value={ts.isoformat()}")
+            print(f"[upsert] period_end_dt type={type(period_end_dt).__name__} value={period_end_dt}")
             if row:
                 print(f"[upsert] existing user id={row['id']} — running UPDATE")
                 result = await conn.execute(
