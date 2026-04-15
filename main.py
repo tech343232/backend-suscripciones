@@ -437,15 +437,25 @@ async def health():
     except Exception as e:
         results["dns_external_8888"] = {"ok": False, "host": db_host, "error": str(e)}
 
-    # 5. Conexión directa PostgreSQL por IP (asyncpg)
+    # 5. Conexión directa PostgreSQL + schema de tabla usuarios
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            val = await conn.fetchval("SELECT 1")
+            await conn.fetchval("SELECT 1")
+            schema_rows = await conn.fetch("""
+                SELECT column_name, data_type, is_nullable
+                FROM information_schema.columns
+                WHERE table_name = 'usuarios'
+                ORDER BY ordinal_position
+            """)
+            columns = [
+                {"column": r["column_name"], "type": r["data_type"], "nullable": r["is_nullable"]}
+                for r in schema_rows
+            ]
         results["postgres_direct"] = {
             "ok": True,
-            "select_1": val,
             "database_url_set": bool(get_env("DATABASE_URL")),
+            "usuarios_schema": columns,
         }
     except Exception as e:
         results["postgres_direct"] = {
